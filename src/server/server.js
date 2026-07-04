@@ -56,6 +56,12 @@ let isAuthenticated = false;
 const trackCollectionCache = new Map();
 const TRACK_CACHE_TTL_MS = 15 * 60 * 1000;
 const TRACK_FETCH_CONCURRENCY = 4;
+const TRACK_FILTER_CACHE_VERSION = 'playable-v3';
+const PLAYLIST_TRACK_FIELDS = [
+  'total',
+  'items(track(id,uri,name,duration_ms,is_playable,is_local,type,available_markets,restrictions,artists(name,uri),album(name,uri,images)))'
+].join(',');
+let cachedUserMarket = null;
 
 function requireAuthentication(res) {
   if (isAuthenticated) return true;
@@ -86,9 +92,59 @@ function setCachedCollection(cacheKey, total, items) {
   return { total, items, cached: false, cachedAt: createdAt };
 }
 
+async function getUserMarket() {
+  if (cachedUserMarket) return cachedUserMarket;
+
+  try {
+    const response = await spotifyApi.getMe();
+    cachedUserMarket = response.body.country || null;
+  } catch (error) {
+    console.warn('Could not resolve Spotify user market:', error.message);
+  }
+
+  return cachedUserMarket;
+}
+
+function getTrackCollectionCacheKey(cacheKey) {
+  return `${TRACK_FILTER_CACHE_VERSION}:${cacheKey}`;
+}
+
+function getPagingOptions(req, defaultLimit, maxLimit) {
+  const parsedOffset = Number.parseInt(req.query.offset, 10);
+  const parsedLimit = Number.parseInt(req.query.limit, 10);
+  const offset = Number.isFinite(parsedOffset) && parsedOffset >= 0 ? parsedOffset : 0;
+  const limit = Number.isFinite(parsedLimit) && parsedLimit > 0
+    ? Math.min(parsedLimit, maxLimit)
+    : defaultLimit;
+
+  return { limit, offset };
+}
+
+function shouldUsePagedResponse(req) {
+  return req.query.progressive === '1' || req.query.offset != null || req.query.limit != null;
+}
+
+function buildTrackFetchOptions(options, market, extra = {}) {
+  return {
+    ...options,
+    ...(market ? { market } : {}),
+    ...extra
+  };
+}
+
 function toTrackPayload(item) {
   const track = item && item.track ? item.track : item;
-  if (!track || !track.uri || track.uri.startsWith('spotify:local:')) {
+  if (
+    !track ||
+    !track.uri ||
+    !track.id ||
+    (track.type && track.type !== 'track') ||
+    track.is_local === true ||
+    track.uri.startsWith('spotify:local:') ||
+    track.is_playable === false ||
+    (Array.isArray(track.available_markets) && track.available_markets.length === 0) ||
+    (track.restrictions && track.restrictions.reason)
+  ) {
     return null;
   }
 
@@ -106,6 +162,7 @@ function toTrackPayload(item) {
     artists,
     duration_ms: track.duration_ms || 0,
     is_playable: track.is_playable !== false,
+    available_markets: Array.isArray(track.available_markets) ? track.available_markets : undefined,
     album: track.album
       ? {
           name: track.album.name || '',
@@ -117,7 +174,8 @@ function toTrackPayload(item) {
 }
 
 async function fetchCachedTrackCollection(cacheKey, fetchPage, limit) {
-  const cached = getCachedCollection(cacheKey);
+  const versionedCacheKey = getTrackCollectionCacheKey(cacheKey);
+  const cached = getCachedCollection(versionedCacheKey);
   if (cached) {
     console.log(`Serving ${cacheKey} from cache (${cached.items.length}/${cached.total} tracks)`);
     return cached;
@@ -161,7 +219,7 @@ async function fetchCachedTrackCollection(cacheKey, fetchPage, limit) {
   }
 
   console.log(`Caching ${tracks.length}/${total} tracks for ${cacheKey}`);
-  return setCachedCollection(cacheKey, total, tracks);
+  return setCachedCollection(versionedCacheKey, total, tracks);
 }
 
 function sendTrackCollection(res, collection) {
@@ -170,6 +228,48 @@ function sendTrackCollection(res, collection) {
     items: collection.items,
     cached: collection.cached,
     cached_at: collection.cachedAt
+  });
+}
+
+async function fetchTrackCollectionPage(cacheKey, fetchPage, paging) {
+  const pageCacheKey = getTrackCollectionCacheKey(`${cacheKey}:page:${paging.offset}:${paging.limit}`);
+  const cached = getCachedCollection(pageCacheKey);
+  if (cached) {
+    return {
+      ...cached,
+      offset: paging.offset,
+      limit: paging.limit,
+      nextOffset: paging.offset + paging.limit < cached.total ? paging.offset + paging.limit : null
+    };
+  }
+
+  const response = await fetchPage(paging);
+  const total = response.body.total || 0;
+  const items = (response.body.items || [])
+    .map((item) => {
+      const payload = toTrackPayload(item);
+      return payload ? { track: payload } : null;
+    })
+    .filter(Boolean);
+
+  const collection = setCachedCollection(pageCacheKey, total, items);
+  return {
+    ...collection,
+    offset: paging.offset,
+    limit: paging.limit,
+    nextOffset: paging.offset + paging.limit < total ? paging.offset + paging.limit : null
+  };
+}
+
+function sendTrackCollectionPage(res, page) {
+  res.json({
+    total: page.total,
+    offset: page.offset,
+    limit: page.limit,
+    next_offset: page.nextOffset,
+    items: page.items,
+    cached: page.cached,
+    cached_at: page.cachedAt
   });
 }
 
@@ -264,10 +364,26 @@ app.get('/playlists', async (req, res) => {
 app.get('/playlist/:id/tracks', async (req, res) => {
   if (!requireAuthentication(res)) return;
   try {
+    const market = await getUserMarket();
+    const fetchPlaylistPage = (options) => spotifyApi.getPlaylistTracks(
+      req.params.id,
+      buildTrackFetchOptions(options, market, { fields: PLAYLIST_TRACK_FIELDS })
+    );
+
     console.log(`Fetching tracks for playlist ${req.params.id}...`);
+    if (shouldUsePagedResponse(req)) {
+      const page = await fetchTrackCollectionPage(
+        `playlist:${req.params.id}`,
+        fetchPlaylistPage,
+        getPagingOptions(req, 100, 100)
+      );
+      sendTrackCollectionPage(res, page);
+      return;
+    }
+
     const collection = await fetchCachedTrackCollection(
       `playlist:${req.params.id}`,
-      (options) => spotifyApi.getPlaylistTracks(req.params.id, options),
+      fetchPlaylistPage,
       100
     );
     sendTrackCollection(res, collection);
@@ -296,10 +412,25 @@ app.get('/liked', async (req, res) => {
   if (!requireAuthentication(res)) return;
 
   try {
+    const market = await getUserMarket();
+    const fetchLikedPage = (options) => spotifyApi.getMySavedTracks(
+      buildTrackFetchOptions(options, market)
+    );
+
     console.log('Fetching liked songs...');
+    if (shouldUsePagedResponse(req)) {
+      const page = await fetchTrackCollectionPage(
+        'liked',
+        fetchLikedPage,
+        getPagingOptions(req, 50, 50)
+      );
+      sendTrackCollectionPage(res, page);
+      return;
+    }
+
     const collection = await fetchCachedTrackCollection(
       'liked',
-      (options) => spotifyApi.getMySavedTracks(options),
+      fetchLikedPage,
       50
     );
     sendTrackCollection(res, collection);
@@ -316,10 +447,26 @@ app.get('/playlist/:id', async (req, res) => {
   if (!requireAuthentication(res)) return;
 
   try {
+    const market = await getUserMarket();
+    const fetchPlaylistPage = (options) => spotifyApi.getPlaylistTracks(
+      req.params.id,
+      buildTrackFetchOptions(options, market, { fields: PLAYLIST_TRACK_FIELDS })
+    );
+
     console.log('Fetching playlist tracks...');
+    if (shouldUsePagedResponse(req)) {
+      const page = await fetchTrackCollectionPage(
+        `playlist:${req.params.id}`,
+        fetchPlaylistPage,
+        getPagingOptions(req, 100, 100)
+      );
+      sendTrackCollectionPage(res, page);
+      return;
+    }
+
     const collection = await fetchCachedTrackCollection(
       `playlist:${req.params.id}`,
-      (options) => spotifyApi.getPlaylistTracks(req.params.id, options),
+      fetchPlaylistPage,
       100
     );
     sendTrackCollection(res, collection);

@@ -12670,6 +12670,10 @@ const media = function media() {
       });
 
     case _actionTypes__WEBPACK_IMPORTED_MODULE_1__[/* ADD_TRACK_FROM_URL */ "a"]:
+      if (typeof window !== "undefined" && window.__webampSpotifySuppressPositionReset) {
+        return state;
+      }
+
       return _babel_runtime_helpers_objectSpread__WEBPACK_IMPORTED_MODULE_0___default()({}, state, {
         timeElapsed: 0
       });
@@ -18017,10 +18021,12 @@ function getCurrentTrackUrlFromState(state) {
 
 	          if (url != null) {
 	            if (isSpotifyExternalPlaybackUrl(url)) {
-	              store.dispatch({
-	                type: actionTypes["Fb" /* UPDATE_TIME_ELAPSED */],
-	                elapsed: 0
-	              });
+	              if (typeof window === "undefined" || !window.__webampSpotifySuppressPositionReset) {
+	                store.dispatch({
+	                  type: actionTypes["Fb" /* UPDATE_TIME_ELAPSED */],
+	                  elapsed: 0
+	                });
+	              }
 	              store.dispatch({
 	                type: actionTypes["p" /* IS_PLAYING */]
 	              });
@@ -19576,8 +19582,11 @@ const Position_mapStateToProps = state => {
   const timeElapsed = selectors["Q" /* getTimeElapsed */](state);
   const userInputFocus = selectors["Y" /* getUserInputFocus */](state);
   const scrubPosition = selectors["Z" /* getUserInputScrubPosition */](state);
-  const position = duration ? Math.floor(timeElapsed) / duration * 100 : 0;
-  const displayedPosition = userInputFocus === "position" ? scrubPosition : position;
+  const isSpotifyPosition = typeof window !== "undefined" && (isSpotifyExternalPlaybackUrl(getCurrentTrackUrlFromState(state)) || window.__webampSpotifyHasActiveTrack);
+  const spotifyPosition = isSpotifyPosition && typeof window.__webampSpotifyPositionPercent === "number" ? Math.max(0, Math.min(100, window.__webampSpotifyPositionPercent)) : null;
+  const spotifyDraftPosition = isSpotifyPosition && window.__webampSpotifySeekBarDragging && typeof window.__webampSpotifySeekBarDraftPercent === "number" ? Math.max(0, Math.min(100, window.__webampSpotifySeekBarDraftPercent)) : null;
+  const position = spotifyDraftPosition == null ? spotifyPosition == null ? duration ? Math.floor(timeElapsed) / duration * 100 : 0 : spotifyPosition : spotifyDraftPosition;
+  const displayedPosition = spotifyDraftPosition == null ? userInputFocus === "position" ? scrubPosition : position : spotifyDraftPosition;
   return {
     displayedPosition,
     position
@@ -20485,9 +20494,28 @@ function rightPad(str, len, fillChar) {
   return str;
 }
 
-const RunningTimeDisplay = props => react_default.a.createElement("div", {
-  className: "playlist-running-time-display draggable"
-}, react_default.a.createElement("div", null, react_default.a.createElement(components_CharacterString, null, rightPad(props.runningTimeMessage, 18, " "))));
+class RunningTimeDisplay extends react_default.a.Component {
+  componentDidMount() {
+    if (typeof window !== "undefined") {
+      this._spotifyLoadingStatusTimer = window.setInterval(() => this.forceUpdate(), 250);
+    }
+  }
+
+  componentWillUnmount() {
+    if (this._spotifyLoadingStatusTimer != null && typeof window !== "undefined") {
+      window.clearInterval(this._spotifyLoadingStatusTimer);
+    }
+  }
+
+  render() {
+    const loadingMessage = typeof window !== "undefined" ? window.__webampSpotifyPlaylistLoadingStatus : null;
+    const runningTimeMessage = loadingMessage || this.props.runningTimeMessage;
+    return react_default.a.createElement("div", {
+      className: "playlist-running-time-display draggable"
+    }, react_default.a.createElement("div", null, react_default.a.createElement(components_CharacterString, null, rightPad(runningTimeMessage, 18, " "))));
+  }
+
+}
 
 const RunningTimeDisplay_mapStateToProps = state => ({
   runningTimeMessage: Object(selectors["I" /* getRunningTimeMessage */])(state)

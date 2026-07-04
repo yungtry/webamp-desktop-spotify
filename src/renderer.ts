@@ -18,8 +18,15 @@ declare global {
     ipcRenderer: {
       send: (channel: string, ...args: any[]) => void;
       on: (channel: string, func: (...args: any[]) => void) => void;
+      once: (channel: string, func: (...args: any[]) => void) => void;
     };
     __webampSpotifySeekToPercent?: (percent: number) => void | Promise<void>;
+    __webampSpotifyPositionPercent?: number;
+    __webampSpotifySeekBarDraftPercent?: number;
+    __webampSpotifySeekBarDragging?: boolean;
+    __webampSpotifySuppressPositionReset?: boolean;
+    __webampSpotifyHasActiveTrack?: boolean;
+    __webampSpotifyPlaylistLoadingStatus?: string | null;
   }
 }
 
@@ -27,6 +34,12 @@ const ipcRenderer = window.ipcRenderer;
 
 const DEFAULT_DOCUMENT_TITLE = document.title
 const SPOTIFY_SERVER_BASE_URL = 'http://127.0.0.1:3000';
+window.__webampSpotifyPositionPercent = 0;
+window.__webampSpotifySeekBarDraftPercent = 0;
+window.__webampSpotifySeekBarDragging = false;
+window.__webampSpotifySuppressPositionReset = false;
+window.__webampSpotifyHasActiveTrack = false;
+window.__webampSpotifyPlaylistLoadingStatus = null;
 let spotifyPlayer: SpotifyPlayerInstance | null = null;
 let currentDeviceId: string | null = null;
 let isSpotifyPlaying = false;
@@ -36,14 +49,19 @@ let pauseRecoveryInProgress = false;
 let lastPauseRecoveryAt = 0;
 let lastAutoAdvancedTrackUri: string | null = null;
 let lastAutoAdvanceAt = 0;
+let suppressAutoAdvanceUntil = 0;
 let playbackRequestSequence = 0;
 let playbackStartPromise: Promise<void> | null = null;
 let playbackStartUri: string | null = null;
 let lastPlaybackCommandAt = 0;
+let consecutivePlaybackErrorSkips = 0;
 let lastTrackChangeUri: string | null = null;
 let lastTrackChangeAt = 0;
 let isSyncingSeekBarFromSpotify = false;
 let lastSeekBarUserInteractionAt = 0;
+let isSeekBarUserDragging = false;
+let seekBarReleaseTimer: number | null = null;
+let suppressSeekBarSyncUntil = 0;
 let playerInitializationPromise: Promise<boolean> | null = null;
 let playbackStateInterval: NodeJS.Timeout | null = null;
 let visualizerInterval: NodeJS.Timeout | null = null;
@@ -88,6 +106,16 @@ let isAuthenticating = false;
 let lastAuthAttempt = 0;
 const AUTH_DEBOUNCE_TIME = 1000; // 1 second debounce
 let suppressPausedStateUntil = 0;
+let playlistLoadSequence = 0;
+let isPlaylistAppendInProgress = false;
+let suppressTrackChangeDuringAppendUntil = 0;
+const TRACK_END_ADVANCE_WINDOW_MS = 1500;
+const AUTO_ADVANCE_DEBOUNCE_MS = 5000;
+const AUTO_ADVANCE_LOAD_GRACE_MS = 8000;
+const SEEK_BAR_SYNC_SUPPRESSION_MS = 1500;
+const MAX_CONSECUTIVE_PLAYBACK_ERROR_SKIPS = 1;
+const PLAYBACK_START_RETRY_DELAYS_MS = [0, 750, 1500, 2500];
+const PLAYLIST_APPEND_EVENT_SUPPRESSION_MS = 1000;
 
 type SpotifyTrackResponseItem = {
   track: SpotifyTrack;
@@ -100,6 +128,25 @@ type PlaySpotifyTrackOptions = {
 
 type PlaybackUiState = 'playing' | 'paused' | 'stopped';
 
+type SpotifyPlaybackStartResult = {
+  ok: boolean;
+  stale?: boolean;
+  status?: number;
+  statusText?: string;
+  errorData?: unknown;
+  attempts?: number;
+};
+
+type SpotifyTrackPageResponse = {
+  total?: number;
+  offset?: number;
+  limit?: number;
+  next_offset?: number | null;
+  items?: SpotifyTrackResponseItem[];
+  cached?: boolean;
+  error?: string;
+};
+
 function createTrackKey(title?: string | null, artist?: string | null): string {
   return `${title || ''}-${artist || ''}`;
 }
@@ -108,11 +155,24 @@ function getPrimaryArtist(track: SpotifyTrack): string {
   return track.artists?.[0]?.name || 'Unknown Artist';
 }
 
+function delay(ms: number): Promise<void> {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
 function getSpotifyTrackFromItem(item: SpotifyTrackResponseItem | { track?: SpotifyTrack } | SpotifyTrack): SpotifyTrack | null {
   const maybeItem = item as SpotifyTrackResponseItem;
   const track = maybeItem.track || (item as SpotifyTrack);
 
-  if (!track?.uri || track.uri.startsWith('spotify:local:')) {
+  if (
+    !track?.uri ||
+    !track.id ||
+    (track.type && track.type !== 'track') ||
+    track.is_local === true ||
+    track.uri.startsWith('spotify:local:') ||
+    track.is_playable === false ||
+    (Array.isArray(track.available_markets) && track.available_markets.length === 0) ||
+    track.restrictions?.reason
+  ) {
     return null;
   }
 
@@ -177,23 +237,132 @@ function clearPlaybackStateInterval() {
   }
 }
 
-function syncSeekingBarFromSpotify(positionMs: number, durationMs: number) {
+function isSuppressingTrackChangeDuringAppend(): boolean {
+  return isPlaylistAppendInProgress || Date.now() < suppressTrackChangeDuringAppendUntil;
+}
+
+function createPlaylistLoadingStatus() {
+  window.__webampSpotifyPlaylistLoadingStatus = 'LOAD TRACKS';
+}
+
+function setPlaylistLoadingStatus(_status: void, message: string) {
+  window.__webampSpotifyPlaylistLoadingStatus = message;
+}
+
+function removePlaylistLoadingStatus(_status: void) {
+  window.__webampSpotifyPlaylistLoadingStatus = null;
+}
+
+async function appendTracksWithoutPlaybackSideEffects(tracks: (WebampTrack & WebampSpotifyTrack)[]) {
+  isPlaylistAppendInProgress = true;
+  suppressTrackChangeDuringAppendUntil = Date.now() + PLAYLIST_APPEND_EVENT_SUPPRESSION_MS;
+  window.__webampSpotifySuppressPositionReset = true;
+
+  try {
+    await Promise.resolve(webamp.appendTracks(tracks));
+  } finally {
+    suppressTrackChangeDuringAppendUntil = Date.now() + PLAYLIST_APPEND_EVENT_SUPPRESSION_MS;
+    window.setTimeout(() => {
+      if (Date.now() >= suppressTrackChangeDuringAppendUntil) {
+        isPlaylistAppendInProgress = false;
+        window.__webampSpotifySuppressPositionReset = false;
+      }
+    }, PLAYLIST_APPEND_EVENT_SUPPRESSION_MS);
+  }
+}
+
+function setSpotifyPositionPercent(percent: number) {
+  window.__webampSpotifyHasActiveTrack = Boolean(
+    activeSpotifyUri ||
+    lastPlayedTrackUri ||
+    isSpotifyPlaying ||
+    desiredSpotifyPlayback === 'playing'
+  );
+  window.__webampSpotifyPositionPercent = Math.max(0, Math.min(100, percent));
+}
+
+function setSeekBarDraftPercent(percent: number) {
+  window.__webampSpotifySeekBarDraftPercent = Math.max(0, Math.min(100, percent));
+}
+
+function readSeekBarPercent(): number | null {
   const seekingBar = document.getElementById('position') as HTMLInputElement;
-  if (!seekingBar || durationMs <= 0 || isSeekingFromWebamp) return;
+  if (!seekingBar) return null;
+
+  const percent = Number(seekingBar.value);
+  return Number.isFinite(percent) ? Math.max(0, Math.min(100, percent)) : null;
+}
+
+function setSeekBarPercent(percent: number) {
+  const seekingBar = document.getElementById('position') as HTMLInputElement;
+  const clampedPercent = Math.max(0, Math.min(100, percent));
+  setSpotifyPositionPercent(clampedPercent);
+  if (!seekingBar) return;
+
+  seekingBar.value = clampedPercent.toString();
+}
+
+function syncSeekingBarFromSpotify(positionMs: number, durationMs: number) {
+  if (durationMs > 0) {
+    setSpotifyPositionPercent((positionMs / durationMs) * 100);
+  }
+
+  const seekingBar = document.getElementById('position') as HTMLInputElement;
+  if (
+    !seekingBar ||
+    durationMs <= 0 ||
+    isSeekingFromWebamp ||
+    isSeekBarUserDragging ||
+    Date.now() < suppressSeekBarSyncUntil
+  ) {
+    return;
+  }
 
   isSyncingSeekBarFromSpotify = true;
-  seekingBar.value = ((positionMs / durationMs) * 100).toString();
+  setSeekBarPercent((positionMs / durationMs) * 100);
   window.setTimeout(() => {
     isSyncingSeekBarFromSpotify = false;
   }, 0);
 }
 
-function markSeekBarUserInteraction() {
+function beginSeekBarUserInteraction() {
   lastSeekBarUserInteractionAt = Date.now();
+  isSeekBarUserDragging = true;
+  window.__webampSpotifySeekBarDragging = true;
+  suppressSeekBarSyncUntil = Date.now() + SEEK_BAR_SYNC_SUPPRESSION_MS;
+
+  const currentPercent = readSeekBarPercent();
+  if (currentPercent !== null) {
+    setSeekBarDraftPercent(currentPercent);
+  }
+
+  if (seekBarReleaseTimer !== null) {
+    window.clearTimeout(seekBarReleaseTimer);
+    seekBarReleaseTimer = null;
+  }
 }
 
-window.__webampSpotifySeekToPercent = async (percent: number) => {
-  if (!spotifyPlayer || !isSpotifyPlaying) return;
+function endSeekBarUserInteraction() {
+  if (!isSeekBarUserDragging && seekBarReleaseTimer === null) {
+    return;
+  }
+
+  lastSeekBarUserInteractionAt = Date.now();
+  suppressSeekBarSyncUntil = Date.now() + SEEK_BAR_SYNC_SUPPRESSION_MS;
+
+  if (seekBarReleaseTimer !== null) {
+    window.clearTimeout(seekBarReleaseTimer);
+  }
+
+  seekBarReleaseTimer = window.setTimeout(() => {
+    isSeekBarUserDragging = false;
+    window.__webampSpotifySeekBarDragging = false;
+    seekBarReleaseTimer = null;
+  }, 500);
+}
+
+async function seekSpotifyToPercent(percent: number) {
+  if (!spotifyPlayer || isSeekingFromWebamp) return;
 
   const clampedPercent = Math.max(0, Math.min(100, percent));
 
@@ -203,16 +372,22 @@ window.__webampSpotifySeekToPercent = async (percent: number) => {
 
     const newPosition = Math.floor(state.duration * (clampedPercent / 100));
     isSeekingFromWebamp = true;
+    suppressSeekBarSyncUntil = Date.now() + SEEK_BAR_SYNC_SUPPRESSION_MS;
+    setSeekBarDraftPercent(clampedPercent);
+    setSeekBarPercent(clampedPercent);
     await spotifyPlayer.seek(newPosition);
     lastSpotifyPosition = newPosition;
     updateTimeDisplay(newPosition);
     syncWebampElapsedTimeFromSpotify(newPosition);
-    syncSeekingBarFromSpotify(newPosition, state.duration);
   } catch (error) {
     console.error('Failed to seek Spotify playback:', error);
   } finally {
     isSeekingFromWebamp = false;
   }
+}
+
+window.__webampSpotifySeekToPercent = async (percent: number) => {
+  await seekSpotifyToPercent(percent);
 };
 
 function syncWebampElapsedTimeFromSpotify(positionMs: number) {
@@ -249,6 +424,107 @@ function setSpotifyPlaybackState(isPlaying: boolean, uiState: PlaybackUiState = 
   } else if (!isPlaying && wasPlaying) {
     stopVisualizer();
   }
+}
+
+function getWebampPlaylistState() {
+  return (webamp as any)?.store?.getState?.()?.playlist || null;
+}
+
+function getWebampMediaState() {
+  return (webamp as any)?.store?.getState?.()?.media || null;
+}
+
+function canAdvanceWebampTrack(direction: 'next' | 'previous'): boolean {
+  const playlist = getWebampPlaylistState();
+  const media = getWebampMediaState();
+  const trackOrder = playlist?.trackOrder || [];
+
+  if (trackOrder.length === 0) return false;
+  if (media?.repeat || media?.shuffle) return true;
+
+  const currentIndex = trackOrder.indexOf(playlist?.currentTrack);
+  if (currentIndex === -1) return false;
+
+  return direction === 'next'
+    ? currentIndex < trackOrder.length - 1
+    : currentIndex > 0;
+}
+
+function hasSpotifyTrackEnded(state: SpotifyPlaybackState): boolean {
+  if (!state.duration || state.duration <= 0) return false;
+
+  const latestKnownPosition = Math.max(state.position || 0, lastSpotifyPosition || 0);
+  return latestKnownPosition >= state.duration - TRACK_END_ADVANCE_WINDOW_MS;
+}
+
+function clearAutoAdvanceGuardForActivePlayback(state: SpotifyPlaybackState) {
+  const stateTrackUri = state.track_window?.current_track?.uri || null;
+
+  if (!stateTrackUri || hasSpotifyTrackEnded(state)) {
+    return;
+  }
+
+  if (stateTrackUri === activeSpotifyUri || stateTrackUri !== lastAutoAdvancedTrackUri) {
+    lastAutoAdvancedTrackUri = null;
+    suppressAutoAdvanceUntil = 0;
+  }
+}
+
+function isStaleSpotifyStateForActiveTrack(state: SpotifyPlaybackState): boolean {
+  const stateTrackUri = state.track_window?.current_track?.uri || null;
+
+  return Boolean(
+    activeSpotifyUri &&
+    stateTrackUri &&
+    stateTrackUri !== activeSpotifyUri &&
+    (isPlaybackStarting || playbackStartPromise)
+  );
+}
+
+function advanceAfterSpotifyTrackEnd(state: SpotifyPlaybackState, source: string): boolean {
+  if (desiredSpotifyPlayback !== 'playing' || !hasSpotifyTrackEnded(state)) {
+    return false;
+  }
+
+  const stateTrackUri = state.track_window?.current_track?.uri || activeSpotifyUri || lastPlayedTrackUri;
+  const now = Date.now();
+
+  if (stateTrackUri && stateTrackUri === lastAutoAdvancedTrackUri) {
+    return true;
+  }
+
+  if (playbackStartPromise || isPlaybackStarting || now < suppressAutoAdvanceUntil) {
+    console.log('Waiting for Spotify to load the next track before auto-advancing again:', {
+      source,
+      stateTrackUri,
+      activeSpotifyUri
+    });
+    return true;
+  }
+
+  if (stateTrackUri === lastAutoAdvancedTrackUri && now - lastAutoAdvanceAt < AUTO_ADVANCE_DEBOUNCE_MS) {
+    return true;
+  }
+
+  lastAutoAdvancedTrackUri = stateTrackUri;
+  lastAutoAdvanceAt = now;
+  suppressAutoAdvanceUntil = now + AUTO_ADVANCE_LOAD_GRACE_MS;
+  activeSpotifyUri = null;
+  lastPlayedTrackUri = null;
+  lastSpotifyPosition = 0;
+  syncWebampElapsedTimeFromSpotify(0);
+  setSeekBarPercent(0);
+
+  console.log('Spotify track ended, advancing Webamp playlist:', { source, stateTrackUri });
+
+  if (!advanceWebampTrack('next')) {
+    console.log('No next Webamp track available, stopping playback');
+    stopSpotifyPlayback().catch((error) => {
+      console.error('Failed to stop playback after playlist ended:', error);
+    });
+  }
+
+  return true;
 }
 
 async function recoverUnexpectedSpotifyPause(reason: string, state?: SpotifyPlaybackState | null) {
@@ -294,6 +570,74 @@ async function recoverUnexpectedSpotifyPause(reason: string, state?: SpotifyPlay
   } finally {
     pauseRecoveryInProgress = false;
   }
+}
+
+async function readSpotifyErrorData(response: Response): Promise<unknown> {
+  try {
+    return await response.json();
+  } catch (error) {
+    return null;
+  }
+}
+
+function shouldRetrySpotifyPlaybackStart(status: number): boolean {
+  return status === 403 || status === 404 || status === 429 || status >= 500;
+}
+
+async function startSpotifyPlaybackOnDevice(
+  token: string,
+  body: any,
+  uri: string,
+  requestId: number
+): Promise<SpotifyPlaybackStartResult> {
+  let lastResult: SpotifyPlaybackStartResult = { ok: false, attempts: 0 };
+
+  for (let attemptIndex = 0; attemptIndex < PLAYBACK_START_RETRY_DELAYS_MS.length; attemptIndex++) {
+    const retryDelay = PLAYBACK_START_RETRY_DELAYS_MS[attemptIndex];
+    if (retryDelay > 0) {
+      await delay(retryDelay);
+    }
+
+    if (requestId !== playbackRequestSequence) {
+      return { ok: false, stale: true, attempts: attemptIndex + 1 };
+    }
+
+    console.log('Starting playback on device:', {
+      deviceId: currentDeviceId,
+      uri,
+      attempt: attemptIndex + 1
+    });
+
+    const response = await fetch(`https://api.spotify.com/v1/me/player/play?device_id=${currentDeviceId}`, {
+      method: 'PUT',
+      headers: {
+        'Authorization': `Bearer ${token}`,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify(body)
+    });
+
+    if (response.ok) {
+      return { ok: true };
+    }
+
+    const errorData = await readSpotifyErrorData(response);
+    lastResult = {
+      ok: false,
+      status: response.status,
+      statusText: response.statusText,
+      errorData,
+      attempts: attemptIndex + 1
+    };
+
+    if (!shouldRetrySpotifyPlaybackStart(response.status) || attemptIndex === PLAYBACK_START_RETRY_DELAYS_MS.length - 1) {
+      return lastResult;
+    }
+
+    console.warn('Spotify playback start failed, retrying:', lastResult);
+  }
+
+  return lastResult;
 }
 
 // Function to get canvas reference
@@ -454,20 +798,31 @@ async function initSpotifyPlayer() {
             spotifyPlayer.addListener('player_state_changed', async (state: SpotifyPlaybackState | null) => {
               console.log('Playback state changed:', state);
               if (state) {
-	                if (state.paused && desiredSpotifyPlayback === 'playing') {
-	                  if (playbackStartPromise || Date.now() < suppressPausedStateUntil) {
-	                    console.log('Ignoring transient paused state during playback start');
-	                    return;
-	                  }
+                if (isStaleSpotifyStateForActiveTrack(state)) {
+                  console.log('Ignoring stale Spotify state while a new Webamp track is starting');
+                  return;
+                }
 
-	                  desiredSpotifyPlayback = 'paused';
-	                  setSpotifyPlaybackState(false, 'paused');
-	                  clearPlaybackStateInterval();
-	                  return;
-	                }
+                clearAutoAdvanceGuardForActivePlayback(state);
+
+                if (advanceAfterSpotifyTrackEnd(state, 'player_state_changed')) {
+                  return;
+                }
+
+                if (state.paused && desiredSpotifyPlayback === 'playing') {
+                  if (playbackStartPromise || Date.now() < suppressPausedStateUntil) {
+                    console.log('Ignoring transient paused state during playback start');
+                    return;
+                  }
+
+                  desiredSpotifyPlayback = 'paused';
+                  setSpotifyPlaybackState(false, 'paused');
+                  clearPlaybackStateInterval();
+                  return;
+                }
 
                 const wasPlaying = isSpotifyPlaying;
-                setSpotifyPlaybackState(!state.paused);
+                setSpotifyPlaybackState(!state.paused, state.paused ? 'paused' : 'playing');
 
                 // Handle initial playback
                 if (isSpotifyPlaying && !wasPlaying) {
@@ -588,7 +943,6 @@ async function performSpotifyTrackPlayback(
   console.log('Starting playback...', { uri, startPosition });
   desiredSpotifyPlayback = 'playing';
   activeSpotifyUri = uri;
-  lastAutoAdvancedTrackUri = null;
   
   // Check if this is a local file
   if (uri.startsWith('spotify:local:')) {
@@ -663,7 +1017,7 @@ async function performSpotifyTrackPlayback(
     }
 
     // Wait a bit for the transfer to take effect
-    await new Promise(resolve => setTimeout(resolve, 50));
+    await delay(250);
 
     // Prepare request body
     const body: any = {
@@ -679,34 +1033,38 @@ async function performSpotifyTrackPlayback(
       return;
     }
 
-    // Make the playback request
-    console.log('Starting playback on device:', currentDeviceId);
-    const response = await fetch(`https://api.spotify.com/v1/me/player/play?device_id=${currentDeviceId}`, {
-      method: 'PUT',
-      headers: {
-        'Authorization': `Bearer ${token}`,
-        'Content-Type': 'application/json'
-      },
-      body: JSON.stringify(body)
-    });
+    const playbackStartResult = await startSpotifyPlaybackOnDevice(token, body, uri, requestId);
 
-    if (!response.ok) {
-      let errorMessage = `${response.status} ${response.statusText}`;
-      try {
-        const errorData = await response.json();
-        console.error('Playback API error details:', errorData);
-        errorMessage += `: ${JSON.stringify(errorData)}`;
-
-        // If we get a 403 error, automatically skip to next track
-        if (response.status === 403) {
-          console.log('Track unavailable (403), skipping to next track...');
-          advanceWebampTrack('next');
-          return; // Exit the function early
-        }
-      } catch (e) {
-        console.error('Could not parse error response:', e);
+    if (!playbackStartResult.ok) {
+      if (playbackStartResult.stale) {
+        console.log('Skipping stale Spotify playback request after play retries:', { uri, requestId });
+        return;
       }
-      throw new Error(`Playback failed: ${errorMessage}`);
+
+      const errorMessage = [
+        playbackStartResult.status,
+        playbackStartResult.statusText,
+        playbackStartResult.errorData ? JSON.stringify(playbackStartResult.errorData) : null
+      ].filter(Boolean).join(' ');
+
+      console.error('Playback API error details:', playbackStartResult);
+
+      if (
+        playbackStartResult.status === 403 &&
+        consecutivePlaybackErrorSkips < MAX_CONSECUTIVE_PLAYBACK_ERROR_SKIPS
+      ) {
+        consecutivePlaybackErrorSkips += 1;
+        console.warn('Track playback was rejected after retries, skipping one track:', {
+          uri,
+          consecutivePlaybackErrorSkips
+        });
+
+        if (advanceWebampTrack('next')) {
+          return;
+        }
+      }
+
+      throw new Error(`Playback failed after ${playbackStartResult.attempts || 1} attempt(s): ${errorMessage}`);
     }
 
     if (requestId !== playbackRequestSequence && !options.force) {
@@ -714,6 +1072,7 @@ async function performSpotifyTrackPlayback(
       return;
     }
 
+    consecutivePlaybackErrorSkips = 0;
     setSpotifyPlaybackState(true);
     startPlaybackStateMonitoring();
     setTimeout(() => {
@@ -743,150 +1102,136 @@ async function loadSpotifyPlaylists(): Promise<SpotifyPlaylist[]> {
   }
 }
 
-// Show Spotify playlist selector
-async function showPlaylistSelector(ejectButton: Element): Promise<void> {
+type SpotifyPlaylistMenuSelection = {
+  requestId: string;
+  value: string | null;
+};
+
+function showNativePlaylistMenu(ejectButton: Element, playlists: SpotifyPlaylist[]): Promise<string | null> {
   const ejectRect = ejectButton.getBoundingClientRect();
-  
-  // Remove any existing wrapper
-  const existingWrapper = document.querySelector('.spotify-playlist-wrapper');
-  if (existingWrapper) {
-    existingWrapper.remove();
-  }
-  
-  // Create wrapper div to handle clicks
-  const wrapper = document.createElement('div');
-  wrapper.className = 'spotify-playlist-wrapper';
-  wrapper.style.position = 'absolute';
-  wrapper.style.left = `${ejectRect.left}px`;
-  wrapper.style.top = `${ejectRect.bottom + 5}px`; // 5px below the eject button
-  wrapper.style.zIndex = '99999';
-  
-  const select = document.createElement('select');
-  
-  // Add a default option
-  const defaultOption = document.createElement('option');
-  defaultOption.text = 'Select a playlist...';
-  defaultOption.value = '';
-  select.appendChild(defaultOption);
+  const requestId = `spotify-playlist-${Date.now()}-${Math.random().toString(16).slice(2)}`;
 
-  // Add Liked Songs option
-  const likedSongsOption = document.createElement('option');
-  likedSongsOption.text = 'Liked Songs';
-  likedSongsOption.value = 'liked';
-  select.appendChild(likedSongsOption);
-  
-  // Load and populate playlists
-  const playlists = await loadSpotifyPlaylists();
-  playlists.forEach((playlist: SpotifyPlaylist) => {
-    const option = document.createElement('option');
-    option.value = playlist.id;
-    option.text = playlist.name;
-    select.appendChild(option);
+  return new Promise((resolve) => {
+    const timeoutId = window.setTimeout(() => resolve(null), 30000);
+
+    window.ipcRenderer.once('spotify-playlist-menu-selected', (selection: SpotifyPlaylistMenuSelection) => {
+      if (!selection || selection.requestId !== requestId) return;
+
+      window.clearTimeout(timeoutId);
+      resolve(selection.value || null);
+    });
+
+    window.ipcRenderer.send('show-spotify-playlist-menu', {
+      requestId,
+      playlists,
+      x: Math.round(ejectRect.left),
+      y: Math.round(ejectRect.bottom + 5)
+    });
   });
-  
-  // Handle playlist selection
-  select.onchange = async () => {
-    if (!select.value) return;
+}
 
-    // Remove dropdown immediately
-    document.body.removeChild(wrapper);
+async function loadTracksIntoWebamp(baseUrl: string, pageLimit: number, loadingStatus: void) {
+  const loadId = ++playlistLoadSequence;
+  setPlaylistLoadingStatus(loadingStatus, 'LOAD TRACKS');
+  await webamp.setTracksToPlay([]);
 
-    disablePlaybackControls();
+  let totalProcessed = 0;
+  let totalAvailable = 0;
+  let offset = 0;
 
-    // Stop current playback
-    if (spotifyPlayer && isSpotifyPlaying) {
-      await stopSpotifyPlayback();
-    }
+  const appendItems = async (items: SpotifyTrackResponseItem[]) => {
+    const batchSize = 100;
+    let batch: (WebampTrack & WebampSpotifyTrack)[] = [];
+    let appended = 0;
 
-    // Create loading indicator
-    const loadingDiv = document.createElement('div');
-    loadingDiv.style.position = 'fixed';
-    loadingDiv.style.top = '50%';
-    loadingDiv.style.left = '50%';
-    loadingDiv.style.transform = 'translate(-50%, -50%)';
-    loadingDiv.style.backgroundColor = '#fff';
-    loadingDiv.style.color = '#000';
-    loadingDiv.style.padding = '10px';
-    loadingDiv.style.zIndex = '100000';
-    document.body.appendChild(loadingDiv);
+    for (const item of items) {
+      if (loadId !== playlistLoadSequence) return appended;
 
-    try {
-      const loadTracksIntoWebamp = async (url: string) => {
-        loadingDiv.textContent = 'Clearing current playlist...';
-        await webamp.setTracksToPlay([]);
+      const track = createWebampSpotifyTrack(item);
+      if (!track) continue;
 
-        loadingDiv.textContent = 'Loading tracks...';
-        const response = await fetch(url);
-        const data = await response.json();
-        if (!response.ok || data.error) {
-          throw new Error(data.error || `Failed to load tracks: ${response.status}`);
-        }
+      batch.push(track);
+      appended++;
 
-        const items = data.items || [];
-        const totalTracks = data.total || items.length;
-        const batchSize = 200;
-        let batch: (WebampTrack & WebampSpotifyTrack)[] = [];
-        let totalProcessed = 0;
-
-        loadingDiv.textContent = `${data.cached ? 'Using cached' : 'Processing'} tracks... 0/${totalTracks}`;
-
-        for (const item of items) {
-          const track = createWebampSpotifyTrack(item);
-          if (!track) continue;
-
-          batch.push(track);
-          totalProcessed++;
-
-          if (batch.length >= batchSize) {
-            webamp.appendTracks(batch);
-            loadingDiv.textContent = `Processing tracks... ${totalProcessed}/${totalTracks}`;
-            batch = [];
-            await new Promise(resolve => setTimeout(resolve, 0));
-          }
-        }
-
-        if (batch.length > 0) {
-          webamp.appendTracks(batch);
-        }
-
-        loadingDiv.textContent = `Loaded ${totalProcessed}/${totalTracks} tracks`;
-      };
-
-      if (select.value === 'liked') {
-        await loadTracksIntoWebamp(`${SPOTIFY_SERVER_BASE_URL}/liked`);
-      } else {
-        await loadTracksIntoWebamp(`${SPOTIFY_SERVER_BASE_URL}/playlist/${select.value}`);
+      if (batch.length >= batchSize) {
+        await appendTracksWithoutPlaybackSideEffects(batch);
+        batch = [];
+        await delay(0);
       }
-    } catch (error) {
-      console.error('Error loading tracks:', error);
-      loadingDiv.textContent = 'Error loading tracks: ' + error.message;
-      await new Promise(resolve => setTimeout(resolve, 2000));
-    } finally {
-      // Re-enable all playback controls
-      enablePlaybackControls();
-      document.body.removeChild(loadingDiv);
     }
+
+    if (batch.length > 0 && loadId === playlistLoadSequence) {
+      await appendTracksWithoutPlaybackSideEffects(batch);
+    }
+
+    return appended;
   };
 
-  // Handle click outside
-  function handleClickOutside(e: MouseEvent) {
-    const wrapper = document.querySelector('.spotify-playlist-wrapper');
-    if (wrapper && !wrapper.contains(e.target as Node)) {
-      wrapper.remove();
-      document.removeEventListener('click', handleClickOutside);
+  while (loadId === playlistLoadSequence) {
+    setPlaylistLoadingStatus(loadingStatus, totalAvailable > 0
+      ? `LOAD ${totalProcessed}/${totalAvailable}`
+      : 'LOAD TRACKS');
+
+    const pagedUrl = new URL(baseUrl);
+    pagedUrl.searchParams.set('progressive', '1');
+    pagedUrl.searchParams.set('offset', offset.toString());
+    pagedUrl.searchParams.set('limit', pageLimit.toString());
+
+    const response = await fetch(pagedUrl.toString());
+    const data: SpotifyTrackPageResponse = await response.json();
+    if (!response.ok || data.error) {
+      throw new Error(data.error || `Failed to load tracks: ${response.status}`);
     }
+
+    totalAvailable = data.total || totalAvailable || 0;
+    const appended = await appendItems(data.items || []);
+    totalProcessed += appended;
+
+    setPlaylistLoadingStatus(loadingStatus, data.cached
+      ? `CACHE ${totalProcessed}/${totalAvailable}`
+      : `LOAD ${totalProcessed}/${totalAvailable}`);
+
+    if (data.next_offset == null || data.next_offset <= offset) {
+      break;
+    }
+
+    offset = data.next_offset;
+    await delay(0);
   }
-  
-  // Add small delay before adding click outside handler
-  setTimeout(() => {
-    document.addEventListener('click', handleClickOutside);
-  }, 100);
-  
-  wrapper.appendChild(select);
-  document.body.appendChild(wrapper);
-  
-  // Focus the select element
-  select.focus();
+
+  if (loadId === playlistLoadSequence) {
+    setPlaylistLoadingStatus(loadingStatus, `READY ${totalProcessed}/${totalAvailable || totalProcessed}`);
+    await delay(750);
+  }
+}
+
+// Show Spotify playlist selector
+async function showPlaylistSelector(ejectButton: Element): Promise<void> {
+  document.querySelector('.spotify-playlist-wrapper')?.remove();
+
+  const playlists = await loadSpotifyPlaylists();
+  const selectedPlaylistId = await showNativePlaylistMenu(ejectButton, playlists);
+  if (!selectedPlaylistId) return;
+
+  if (spotifyPlayer && isSpotifyPlaying) {
+    await stopSpotifyPlayback();
+  }
+
+  const loadingStatus = createPlaylistLoadingStatus();
+
+  try {
+    if (selectedPlaylistId === 'liked') {
+      await loadTracksIntoWebamp(`${SPOTIFY_SERVER_BASE_URL}/liked`, 50, loadingStatus);
+    } else {
+      await loadTracksIntoWebamp(`${SPOTIFY_SERVER_BASE_URL}/playlist/${selectedPlaylistId}`, 100, loadingStatus);
+    }
+  } catch (error) {
+    console.error('Error loading tracks:', error);
+    setPlaylistLoadingStatus(loadingStatus, 'LOAD ERROR');
+    await delay(2000);
+  } finally {
+    removePlaylistLoadingStatus(loadingStatus);
+  }
 }
 
 // Function to initialize Spotify authentication
@@ -1006,13 +1351,19 @@ async function startSynchronizedPlayback(spotifyUri: string) {
   startPlaybackStateMonitoring();
 }
 
-function advanceWebampTrack(direction: 'next' | 'previous') {
+function advanceWebampTrack(direction: 'next' | 'previous'): boolean {
+  if (!canAdvanceWebampTrack(direction)) {
+    return false;
+  }
+
   desiredSpotifyPlayback = 'playing';
   if (direction === 'next') {
     (webamp as any).nextTrack();
   } else {
     (webamp as any).previousTrack();
   }
+
+  return true;
 }
 
 async function pauseSpotifyPlayback() {
@@ -1034,8 +1385,14 @@ async function stopSpotifyPlayback() {
   isSeekingFromWebamp = false;
   document.title = DEFAULT_DOCUMENT_TITLE;
   syncWebampElapsedTimeFromSpotify(0);
+  setSeekBarPercent(0);
 
-  await pauseSpotifyPlayback();
+  if (spotifyPlayer) {
+    await spotifyPlayer.pause();
+  }
+
+  setSpotifyPlaybackState(false, 'stopped');
+  clearPlaybackStateInterval();
 }
 
 // Modify the onTrackDidChange handler
@@ -1061,6 +1418,11 @@ webamp.onTrackDidChange((track: any) => {
   console.log('Track lookup:', { trackKey, spotifyUri });
 
   if (spotifyUri) {
+    if (isSuppressingTrackChangeDuringAppend() && (isSpotifyPlaying || activeSpotifyUri)) {
+      console.log('Ignoring Webamp track event caused by progressive playlist append:', { spotifyUri });
+      return;
+    }
+
     if (spotifyUri === activeSpotifyUri && spotifyUri === lastPlayedTrackUri) {
       console.log('Ignoring Webamp status-only track event for active Spotify track:', { spotifyUri });
       return;
@@ -1074,11 +1436,15 @@ webamp.onTrackDidChange((track: any) => {
     lastTrackChangeUri = spotifyUri;
     lastTrackChangeAt = now;
 
-	    // Reset position tracking only after accepting a real track change.
-	    lastSpotifyPosition = 0;
-	    isSeekingFromWebamp = false;
-	    isPlaybackStarting = true;
-	    syncWebampElapsedTimeFromSpotify(0);
+    // Reset position tracking only after accepting a real track change.
+    lastSpotifyPosition = 0;
+    activeSpotifyUri = spotifyUri;
+    isSeekingFromWebamp = false;
+    isPlaybackStarting = true;
+    suppressSeekBarSyncUntil = Date.now() + AUTO_ADVANCE_LOAD_GRACE_MS;
+    updateTimeDisplay(0);
+    setSeekBarPercent(0);
+    syncWebampElapsedTimeFromSpotify(0);
 
     console.log('Spotify track detected:', {
       name: track.metaData.title,
@@ -1116,6 +1482,64 @@ function updatePlaybackStateUI(state: PlaybackUiState) {
     classes.push(state === 'playing' ? 'play' : state === 'paused' ? 'pause' : 'stop');
     mainWindow.className = classes.join(' ');
   }
+}
+
+function installAuthenticationHintStyles() {
+  if (document.getElementById('spotify-auth-hint-style')) {
+    return;
+  }
+
+  const style = document.createElement('style');
+  style.id = 'spotify-auth-hint-style';
+  style.textContent = `
+    #webamp #main-window.spotify-auth-needed #about {
+      display: block;
+      overflow: visible;
+      z-index: 20;
+      filter: drop-shadow(0 0 2px #1ed760);
+    }
+
+    #webamp #main-window.spotify-auth-needed #about::after {
+      content: "";
+      position: absolute;
+      left: -6px;
+      top: -6px;
+      width: 25px;
+      height: 27px;
+      border: 1px solid rgba(30, 215, 96, 0.95);
+      background: rgba(30, 215, 96, 0.16);
+      box-shadow:
+        0 0 0 1px rgba(30, 215, 96, 0.35),
+        0 0 6px rgba(30, 215, 96, 0.95),
+        0 0 14px rgba(30, 215, 96, 0.7);
+      pointer-events: none;
+      animation: spotify-auth-logo-glow 1.2s ease-in-out infinite;
+    }
+
+    #webamp #main-window.spotify-auth-needed #about:hover {
+      filter: drop-shadow(0 0 4px #1ed760);
+    }
+
+    #webamp #main-window.spotify-auth-needed #about:hover::after {
+      background: rgba(30, 215, 96, 0.24);
+      box-shadow:
+        0 0 0 1px rgba(30, 215, 96, 0.55),
+        0 0 8px rgba(30, 215, 96, 1),
+        0 0 18px rgba(30, 215, 96, 0.85);
+    }
+
+    @keyframes spotify-auth-logo-glow {
+      0%, 100% {
+        opacity: 0.55;
+        transform: scale(0.95);
+      }
+      50% {
+        opacity: 1;
+        transform: scale(1.08);
+      }
+    }
+  `;
+  document.head.appendChild(style);
 }
 
 // Function to generate fake analyzer data with smoother transitions
@@ -1473,6 +1897,13 @@ function startPlaybackStateMonitoring() {
     try {
       const state = await spotifyPlayer.getCurrentState();
       if (state) {
+        if (isStaleSpotifyStateForActiveTrack(state)) {
+          console.log('Ignoring stale Spotify monitor state while a new Webamp track is starting');
+          return;
+        }
+
+        clearAutoAdvanceGuardForActivePlayback(state);
+
         // Only update if we're not seeking from Webamp
         if (!isSeekingFromWebamp) {
           lastSpotifyPosition = state.position;
@@ -1487,49 +1918,31 @@ function startPlaybackStateMonitoring() {
           document.title = `${name} - ${artists[0].name}`;
         }
 
-	        const stateTrackUri = state.track_window?.current_track?.uri || null;
-	        updateTimeDisplay(state.position);
-	        syncWebampElapsedTimeFromSpotify(state.position);
-	        syncSeekingBarFromSpotify(state.position, state.duration);
+        updateTimeDisplay(state.position);
+        syncWebampElapsedTimeFromSpotify(state.position);
+        syncSeekingBarFromSpotify(state.position, state.duration);
 
-        // Check if track has ended (position is at or very close to duration)
-        if (state.position >= state.duration - 500) { // 500ms buffer
-          const now = Date.now();
-          if (stateTrackUri === lastAutoAdvancedTrackUri && now - lastAutoAdvanceAt < 5000) {
+        if (advanceAfterSpotifyTrackEnd(state, 'playback_state_monitor')) {
+          return;
+        }
+
+        // If track has been paused externally
+        if (state.paused && isSpotifyPlaying) {
+          if (desiredSpotifyPlayback === 'playing') {
+            if (playbackStartPromise || Date.now() < suppressPausedStateUntil) {
+              return;
+            }
+
+            desiredSpotifyPlayback = 'paused';
+            setSpotifyPlaybackState(false, 'paused');
+            clearPlaybackStateInterval();
             return;
           }
 
-          lastAutoAdvancedTrackUri = stateTrackUri;
-          lastAutoAdvanceAt = now;
-
-          // Get the next track button and playlist
-          const playlist = document.querySelector('#playlist-window #playlist');
-          
-          if (playlist) {
-            console.log('Track ending, moving to next track');
-            advanceWebampTrack('next');
-              
-	            // Spotify will report the new state through player_state_changed.
-	          }
-	        }
-
-        // If track has been paused externally
-	        if (state.paused && isSpotifyPlaying) {
-	          if (desiredSpotifyPlayback === 'playing') {
-	            if (playbackStartPromise || Date.now() < suppressPausedStateUntil) {
-	              return;
-	            }
-
-	            desiredSpotifyPlayback = 'paused';
-	            setSpotifyPlaybackState(false, 'paused');
-	            clearPlaybackStateInterval();
-	            return;
-	          }
-
-	          document.title = DEFAULT_DOCUMENT_TITLE;
-	          setSpotifyPlaybackState(false, 'paused');
-	          clearPlaybackStateInterval();
-	        }
+          document.title = DEFAULT_DOCUMENT_TITLE;
+          setSpotifyPlaybackState(false, 'paused');
+          clearPlaybackStateInterval();
+        }
       }
     } catch (error) {
       console.error('Error getting playback state:', error);
@@ -1598,6 +2011,7 @@ const appElement = document.getElementById('app');
 if (appElement) {
   webamp.renderWhenReady(appElement).then(() => {
     window.setupRendered();
+    installAuthenticationHintStyles();
     
     // Set up second visualizer
     setupSecondVisualizer();
@@ -1680,11 +2094,31 @@ function setupSeekingBar() {
   if (!seekingBar) return;
 
   ['pointerdown', 'mousedown', 'touchstart', 'keydown'].forEach((eventName) => {
-    seekingBar.addEventListener(eventName, markSeekBarUserInteraction);
+    seekingBar.addEventListener(eventName, beginSeekBarUserInteraction);
   });
 
-  seekingBar.addEventListener('change', async (e) => {
-    if (!spotifyPlayer || !isSpotifyPlaying || isResumingPlayback) return;
+  ['pointerup', 'mouseup', 'touchend', 'touchcancel', 'keyup', 'blur'].forEach((eventName) => {
+    seekingBar.addEventListener(eventName, endSeekBarUserInteraction);
+  });
+
+  document.addEventListener('pointerup', endSeekBarUserInteraction);
+  document.addEventListener('mouseup', endSeekBarUserInteraction);
+  document.addEventListener('touchend', endSeekBarUserInteraction);
+
+  seekingBar.addEventListener('input', () => {
+    const currentPercent = readSeekBarPercent();
+    if (currentPercent !== null) {
+      setSeekBarDraftPercent(currentPercent);
+    }
+
+    if (isSyncingSeekBarFromSpotify) return;
+
+    lastSeekBarUserInteractionAt = Date.now();
+    suppressSeekBarSyncUntil = Date.now() + SEEK_BAR_SYNC_SUPPRESSION_MS;
+  }, { capture: true });
+
+  seekingBar.addEventListener('change', async () => {
+    if (!spotifyPlayer || isResumingPlayback || isSeekingFromWebamp) return;
     if (isSyncingSeekBarFromSpotify) return;
 
     if (Date.now() - lastSeekBarUserInteractionAt > 2000) {
@@ -1693,33 +2127,12 @@ function setupSeekingBar() {
     }
 
     try {
-      // Get current state to get accurate duration
-      const state = await spotifyPlayer.getCurrentState();
-      if (!state) return;
-
-      // Calculate new position based on percentage of total duration
       const percentage = parseFloat(seekingBar.value);
-      const newPosition = Math.floor(state.duration * (percentage / 100));
-
-      // Don't seek if we're very close to the start (first 2 seconds) and the percentage is small
-      if (state.position < 2000 && percentage <= 1) {
-        console.log('Ignoring seek near start of track');
-        return;
-      }
-
-      console.log('Seeking to position:', { 
-        percentage,
-        newPosition,
-        totalDuration: state.duration
-      });
-
-      isSeekingFromWebamp = true;
-      await spotifyPlayer.seek(newPosition);
-      lastSpotifyPosition = newPosition;
+      await seekSpotifyToPercent(percentage);
     } catch (error) {
       console.error('Failed to seek Spotify playback:', error);
     } finally {
-      isSeekingFromWebamp = false;
+      endSeekBarUserInteraction();
     }
   });
 }
@@ -2030,6 +2443,11 @@ function enablePlaybackControls() {
 
 // Add this function after the existing functions
 function updateAuthenticationUI(isAuthenticated: boolean) {
+  const mainWindow = document.querySelector('#main-window') as HTMLElement;
+  if (mainWindow) {
+    mainWindow.classList.toggle('spotify-auth-needed', !isAuthenticated);
+  }
+
   // Disable/enable About button
   const aboutButton = document.querySelector('#main-window #about') as HTMLElement;
   if (aboutButton) {

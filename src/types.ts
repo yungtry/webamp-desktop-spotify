@@ -87,9 +87,15 @@ export interface SpotifyTrack {
     }[];
     duration_ms: number;
     id: string;
-    is_playable: boolean;
+    is_local?: boolean;
+    is_playable?: boolean;
     name: string;
+    type?: string;
     uri: string;
+    available_markets?: string[];
+    restrictions?: {
+        reason?: string;
+    };
 }
 
 export interface WebampSpotifyTrack {
@@ -109,4 +115,4 @@ export interface WebampSpotifyTrack {
 export interface SpotifyPlaylist {
     id: string;
     name: string;
-} 
+}

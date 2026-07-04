@@ -11,6 +11,7 @@ const {
   ipcMain,
   shell,
   BrowserWindow,
+  Menu,
   components
 } = require("electron");
 
@@ -62,6 +63,52 @@ function registerWindowIpcHandlers() {
         window.setIgnoreMouseEvents(false);
       }
     });
+  });
+
+  ipcMain.on("show-spotify-playlist-menu", (event, payload = {}) => {
+    const sender = event.sender;
+    let didSelect = false;
+    const requestId = payload.requestId;
+    const playlists = Array.isArray(payload.playlists) ? payload.playlists : [];
+    const targetWindow = BrowserWindow.fromWebContents(sender) || mainWindow;
+    const sendSelection = (value) => {
+      didSelect = true;
+      if (!sender.isDestroyed()) {
+        sender.send("spotify-playlist-menu-selected", { requestId, value });
+      }
+    };
+
+    const playlistItems = playlists.map((playlist) => ({
+      label: playlist.name || "Untitled playlist",
+      click: () => sendSelection(playlist.id)
+    }));
+
+    const menu = Menu.buildFromTemplate([
+      {
+        label: "Liked Songs",
+        click: () => sendSelection("liked")
+      },
+      { type: "separator" },
+      ...playlistItems
+    ]);
+
+    try {
+      menu.popup({
+        window: targetWindow,
+        x: Number.isFinite(payload.x) ? Math.round(payload.x) : undefined,
+        y: Number.isFinite(payload.y) ? Math.round(payload.y) : undefined,
+        callback: () => {
+          if (!didSelect) {
+            sendSelection(null);
+          }
+        }
+      });
+    } catch (error) {
+      console.error("Failed to show Spotify playlist menu:", error);
+      if (!didSelect) {
+        sendSelection(null);
+      }
+    }
   });
 }
 
