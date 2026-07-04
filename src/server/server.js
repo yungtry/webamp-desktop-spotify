@@ -49,10 +49,163 @@ app.use((req, res, next) => {
 const spotifyApi = new SpotifyWebApi({
   clientId: envConfig.SPOTIFY_CLIENT_ID,
   clientSecret: envConfig.SPOTIFY_CLIENT_SECRET,
-  redirectUri: `http://localhost:${port}/callback`
+  redirectUri: envConfig.SPOTIFY_REDIRECT_URI || `http://127.0.0.1:${port}/callback`
 });
 
 let isAuthenticated = false;
+const trackCollectionCache = new Map();
+const TRACK_CACHE_TTL_MS = 15 * 60 * 1000;
+const TRACK_FETCH_CONCURRENCY = 4;
+
+function requireAuthentication(res) {
+  if (isAuthenticated) return true;
+  res.status(401).json({ error: 'Not authenticated' });
+  return false;
+}
+
+function getCachedCollection(cacheKey) {
+  const cached = trackCollectionCache.get(cacheKey);
+  if (!cached) return null;
+
+  if (Date.now() - cached.createdAt > TRACK_CACHE_TTL_MS) {
+    trackCollectionCache.delete(cacheKey);
+    return null;
+  }
+
+  return {
+    total: cached.total,
+    items: cached.items,
+    cached: true,
+    cachedAt: cached.createdAt
+  };
+}
+
+function setCachedCollection(cacheKey, total, items) {
+  const createdAt = Date.now();
+  trackCollectionCache.set(cacheKey, { total, items, createdAt });
+  return { total, items, cached: false, cachedAt: createdAt };
+}
+
+function toTrackPayload(item) {
+  const track = item && item.track ? item.track : item;
+  if (!track || !track.uri || track.uri.startsWith('spotify:local:')) {
+    return null;
+  }
+
+  const artists = Array.isArray(track.artists)
+    ? track.artists.map((artist) => ({
+        name: artist.name || 'Unknown Artist',
+        uri: artist.uri || null
+      }))
+    : [];
+
+  return {
+    uri: track.uri,
+    id: track.id || null,
+    name: track.name || 'Unknown Title',
+    artists,
+    duration_ms: track.duration_ms || 0,
+    is_playable: track.is_playable !== false,
+    album: track.album
+      ? {
+          name: track.album.name || '',
+          uri: track.album.uri || null,
+          images: Array.isArray(track.album.images) ? track.album.images : []
+        }
+      : null
+  };
+}
+
+async function fetchCachedTrackCollection(cacheKey, fetchPage, limit) {
+  const cached = getCachedCollection(cacheKey);
+  if (cached) {
+    console.log(`Serving ${cacheKey} from cache (${cached.items.length}/${cached.total} tracks)`);
+    return cached;
+  }
+
+  const firstResponse = await fetchPage({ limit: 1, offset: 0 });
+  const total = firstResponse.body.total || 0;
+  const offsets = [];
+  for (let offset = 0; offset < total; offset += limit) {
+    offsets.push(offset);
+  }
+
+  const tracks = [];
+  for (let index = 0; index < offsets.length; index += TRACK_FETCH_CONCURRENCY) {
+    const batchOffsets = offsets.slice(index, index + TRACK_FETCH_CONCURRENCY);
+    const failedOffsets = [];
+    const pages = await Promise.all(
+      batchOffsets.map((offset) =>
+        fetchPage({ limit, offset })
+          .then((response) => response.body.items || [])
+          .catch((error) => {
+            console.error(`Error fetching ${cacheKey} at offset ${offset}:`, error);
+            failedOffsets.push(offset);
+            return [];
+          })
+      )
+    );
+
+    if (failedOffsets.length > 0) {
+      throw new Error(`Failed to fetch ${cacheKey} pages at offsets: ${failedOffsets.join(', ')}`);
+    }
+
+    pages.forEach((items) => {
+      items.forEach((item) => {
+        const payload = toTrackPayload(item);
+        if (payload) tracks.push({ track: payload });
+      });
+    });
+
+    console.log(`Fetched ${Math.min(offsets[index + batchOffsets.length - 1] + limit, total)}/${total} for ${cacheKey}`);
+  }
+
+  console.log(`Caching ${tracks.length}/${total} tracks for ${cacheKey}`);
+  return setCachedCollection(cacheKey, total, tracks);
+}
+
+function sendTrackCollection(res, collection) {
+  res.json({
+    total: collection.total,
+    items: collection.items,
+    cached: collection.cached,
+    cached_at: collection.cachedAt
+  });
+}
+
+function writeAscii(view, offset, value) {
+  for (let i = 0; i < value.length; i++) {
+    view.setUint8(offset + i, value.charCodeAt(i));
+  }
+}
+
+function createSilentWavBuffer(durationMs) {
+  const sampleRate = 8000;
+  const channels = 1;
+  const bitsPerSample = 8;
+  const safeDurationMs = Math.max(1000, Math.min(durationMs || 1000, 60 * 60 * 1000));
+  const numSamples = Math.ceil(sampleRate * (safeDurationMs / 1000));
+  const dataSize = numSamples * channels * (bitsPerSample / 8);
+  const fileSize = 44 + dataSize;
+  const buffer = Buffer.alloc(fileSize, 128);
+  const view = new DataView(buffer.buffer, buffer.byteOffset, buffer.byteLength);
+
+  writeAscii(view, 0, 'RIFF');
+  view.setUint32(4, fileSize - 8, true);
+  writeAscii(view, 8, 'WAVE');
+  writeAscii(view, 12, 'fmt ');
+  view.setUint32(16, 16, true);
+  view.setUint16(20, 1, true);
+  view.setUint16(22, channels, true);
+  view.setUint32(24, sampleRate, true);
+  view.setUint32(28, sampleRate * channels * (bitsPerSample / 8), true);
+  view.setUint16(32, channels * (bitsPerSample / 8), true);
+  view.setUint16(34, bitsPerSample, true);
+  writeAscii(view, 36, 'data');
+  view.setUint32(40, dataSize, true);
+
+  return buffer;
+}
 
 app.get('/login', (req, res) => {
   const scopes = [
@@ -93,18 +246,12 @@ app.get('/callback', async (req, res) => {
 });
 
 app.get('/token', (req, res) => {
-  if (!isAuthenticated) {
-    res.status(401).json({ error: 'Not authenticated' });
-    return;
-  }
+  if (!requireAuthentication(res)) return;
   res.json({ token: spotifyApi.getAccessToken() });
 });
 
 app.get('/playlists', async (req, res) => {
-  if (!isAuthenticated) {
-    res.status(401).json({ error: 'Not authenticated' });
-    return;
-  }
+  if (!requireAuthentication(res)) return;
   try {
     const data = await spotifyApi.getUserPlaylists();
     res.json(data.body);
@@ -114,69 +261,16 @@ app.get('/playlists', async (req, res) => {
   }
 });
 
-// Function to fetch items in batches
-async function fetchAllItems(fetchFunction, limit = 50) {
-  let items = [];
-  let offset = 0;
-  let total = Infinity;
-  const batchSize = 5; // Number of parallel requests
-  const delayBetweenBatches = 500; // ms
-
-  // First request to get total
-  const initialResponse = await fetchFunction({ limit, offset: 0 });
-  total = initialResponse.body.total;
-  items = items.concat(initialResponse.body.items);
-  offset = limit;
-
-  console.log(`Total items to fetch: ${total}`);
-
-  while (offset < total) {
-    const batchPromises = [];
-    
-    // Create batch of promises
-    for (let i = 0; i < batchSize && offset < total; i++) {
-      const currentOffset = offset;
-      const promise = fetchFunction({ limit, offset: currentOffset })
-        .then(response => {
-          console.log(`Progress: ${Math.min(offset + limit, total)}/${total} items`);
-          return response.body.items;
-        })
-        .catch(error => {
-          console.error(`Error fetching batch at offset ${currentOffset}:`, error);
-          return []; // Return empty array on error
-        });
-      
-      batchPromises.push(promise);
-      offset += limit;
-    }
-
-    // Wait for batch to complete
-    const results = await Promise.all(batchPromises);
-    items = items.concat(...results.filter(batch => batch.length > 0));
-
-    // Add delay between batches
-    if (offset < total) {
-      await new Promise(resolve => setTimeout(resolve, delayBetweenBatches));
-    }
-  }
-
-  console.log(`Fetch complete: ${items.length} items`);
-  return items;
-}
-
 app.get('/playlist/:id/tracks', async (req, res) => {
-  if (!isAuthenticated) {
-    res.status(401).json({ error: 'Not authenticated' });
-    return;
-  }
+  if (!requireAuthentication(res)) return;
   try {
     console.log(`Fetching tracks for playlist ${req.params.id}...`);
-    const items = await fetchAllItems(
+    const collection = await fetchCachedTrackCollection(
+      `playlist:${req.params.id}`,
       (options) => spotifyApi.getPlaylistTracks(req.params.id, options),
       100
     );
-    console.log(`Successfully fetched ${items.length} tracks from playlist`);
-    res.json({ items });
+    sendTrackCollection(res, collection);
   } catch (error) {
     console.error('Error getting playlist tracks:', error);
     res.status(500).json({ 
@@ -198,139 +292,53 @@ app.post('/refresh_token', async (req, res) => {
   }
 });
 
-// Add liked songs endpoint with streaming response
 app.get('/liked', async (req, res) => {
-  if (!isAuthenticated) {
-    res.status(401).json({ error: 'Not authenticated' });
-    return;
-  }
+  if (!requireAuthentication(res)) return;
 
   try {
     console.log('Fetching liked songs...');
-    
-    // Set up streaming response
-    res.setHeader('Content-Type', 'application/json');
-    res.setHeader('Transfer-Encoding', 'chunked');
-    
-    let offset = 0;
-    const limit = 50;
-    
-    // Get initial response to get total
-    const initialResponse = await spotifyApi.getMySavedTracks({ limit: 1, offset: 0 });
-    const total = initialResponse.body.total;
-    
-    // Start the response with total
-    res.write(`{"total":${total},"items":[`);
-    let isFirst = true;
-
-    while (offset < total) {
-      try {
-        const response = await spotifyApi.getMySavedTracks({ limit, offset });
-        const items = response.body.items;
-
-        // Send each item
-        for (const item of items) {
-          if (!isFirst) {
-            res.write(',');
-          }
-          isFirst = false;
-          res.write(JSON.stringify(item));
-          // Flush the data immediately
-          res.flushHeaders();
-        }
-
-        console.log(`Streamed ${offset + items.length}/${total} tracks`);
-        offset += limit;
-
-        // Small delay to prevent rate limiting
-        await new Promise(resolve => setTimeout(resolve, 100));
-      } catch (error) {
-        console.error(`Error fetching batch at offset ${offset}:`, error);
-        break;
-      }
-    }
-
-    // Close the array and send
-    res.write(']}');
-    res.end();
+    const collection = await fetchCachedTrackCollection(
+      'liked',
+      (options) => spotifyApi.getMySavedTracks(options),
+      50
+    );
+    sendTrackCollection(res, collection);
   } catch (error) {
     console.error('Error fetching liked songs:', error);
-    if (!res.headersSent) {
-      res.status(500).json({ 
-        error: 'Failed to fetch liked songs',
-        details: error.message
-      });
-    } else {
-      res.end();
-    }
+    res.status(500).json({ 
+      error: 'Failed to fetch liked songs',
+      details: error.message
+    });
   }
 });
 
 app.get('/playlist/:id', async (req, res) => {
-  if (!isAuthenticated) {
-    res.status(401).json({ error: 'Not authenticated' });
-    return;
-  }
+  if (!requireAuthentication(res)) return;
 
   try {
     console.log('Fetching playlist tracks...');
-    
-    // Set up streaming response
-    res.setHeader('Content-Type', 'application/json');
-    res.setHeader('Transfer-Encoding', 'chunked');
-    
-    let offset = 0;
-    const limit = 50;
-    
-    // Get initial response to get total
-    const initialResponse = await spotifyApi.getPlaylistTracks(req.params.id, { limit: 1, offset: 0 });
-    const total = initialResponse.body.total;
-    
-    // Start the response with total
-    res.write(`{"total":${total},"items":[`);
-    let isFirst = true;
-
-    while (offset < total) {
-      try {
-        const response = await spotifyApi.getPlaylistTracks(req.params.id, { limit, offset });
-        const items = response.body.items;
-
-        // Send each item
-        for (const item of items) {
-          if (!isFirst) {
-            res.write(',');
-          }
-          isFirst = false;
-          res.write(JSON.stringify(item));
-          // Flush the data immediately
-          res.flushHeaders();
-        }
-
-        console.log(`Streamed ${offset + items.length}/${total} tracks`);
-        offset += limit;
-
-        // Small delay to prevent rate limiting
-        await new Promise(resolve => setTimeout(resolve, 100));
-      } catch (error) {
-        console.error(`Error fetching batch at offset ${offset}:`, error);
-        break;
-      }
-    }
-
-    // Close the array and send
-    res.write(']}');
-    res.end();
+    const collection = await fetchCachedTrackCollection(
+      `playlist:${req.params.id}`,
+      (options) => spotifyApi.getPlaylistTracks(req.params.id, options),
+      100
+    );
+    sendTrackCollection(res, collection);
   } catch (error) {
     console.error('Error fetching playlist tracks:', error);
-    if (!res.headersSent) {
-      res.status(500).json({ 
-        error: 'Failed to fetch playlist tracks',
-        details: error.message
-      });
-    } else {
-      res.end();
-    }
+    res.status(500).json({ 
+      error: 'Failed to fetch playlist tracks',
+      details: error.message
+    });
   }
+});
+
+app.get('/silence/:durationMs.wav', (req, res) => {
+  const durationMs = Number.parseInt(req.params.durationMs, 10);
+  const buffer = createSilentWavBuffer(Number.isFinite(durationMs) ? durationMs : 1000);
+
+  res.setHeader('Content-Type', 'audio/wav');
+  res.setHeader('Cache-Control', 'public, max-age=86400');
+  res.send(buffer);
 });
 
 module.exports = { app, spotifyApi }; 

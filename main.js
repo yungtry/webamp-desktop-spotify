@@ -3,7 +3,6 @@ const path = require("path");
 const url = require("url");
 
 const checkForUpdatesAndNotify = require("./src/node/updates.js");
-require('./src/server/index.js'); // Start the Express server
 
 const {
   app,
@@ -19,12 +18,56 @@ if (isDev) {
   require("electron-debug")({ devToolsMode: "detach" });
 }
 
+if (!app.requestSingleInstanceLock()) {
+  app.quit();
+  process.exit(0);
+}
+
+require('./src/server/index.js'); // Start the Express server
+
 // Keep a global reference of the window object, if you don't, the window will
 // be closed automatically when the JavaScript object is garbage collected.
 let mainWindow;
 let authWindow = null;
+let windowIpcHandlersRegistered = false;
+
+function withMainWindow(callback) {
+  if (!mainWindow || mainWindow.isDestroyed()) {
+    return undefined;
+  }
+
+  return callback(mainWindow);
+}
+
+function registerWindowIpcHandlers() {
+  if (windowIpcHandlersRegistered) {
+    return;
+  }
+
+  windowIpcHandlersRegistered = true;
+
+  ipcMain.on("minimize", () => withMainWindow((window) => window.minimize()));
+  ipcMain.on("close", () => withMainWindow((window) => window.close()));
+  ipcMain.on("setThumbnailClip", (_, clip) => {
+    withMainWindow((window) => window.setThumbnailClip(clip));
+  });
+  ipcMain.handle("getBounds", () => withMainWindow((window) => window.getBounds()));
+  ipcMain.handle("getCursorScreenPoint", () => screen.getCursorScreenPoint());
+  
+  ipcMain.on("ignoreMouseEvents", (_, ignore) => {
+    withMainWindow((window) => {
+      if (ignore) {
+        window.setIgnoreMouseEvents(true, { forward: true });
+      } else {
+        window.setIgnoreMouseEvents(false);
+      }
+    });
+  });
+}
 
 function createWindow() {
+  registerWindowIpcHandlers();
+
   const { width, height } = screen.getPrimaryDisplay().workAreaSize;
 
   // Create the browser window.
@@ -52,21 +95,6 @@ function createWindow() {
 
   // Set window to ignore mouse events by default
   mainWindow.setIgnoreMouseEvents(true, { forward: true });
-
-  ipcMain.on("minimize", () => mainWindow.minimize());
-  ipcMain.on("close", () => mainWindow.close());
-  ipcMain.on("setThumbnailClip", (_, clip) => mainWindow.setThumbnailClip(clip));
-  ipcMain.handle("getBounds", () => mainWindow.getBounds());
-  ipcMain.handle("getCursorScreenPoint", () => screen.getCursorScreenPoint());
-  
-  // Modify the ignoreMouseEvents handler to be more precise
-  ipcMain.on("ignoreMouseEvents", (_, ignore, options = {}) => {
-    if (ignore) {
-      mainWindow.setIgnoreMouseEvents(true, { forward: true });
-    } else {
-      mainWindow.setIgnoreMouseEvents(false);
-    }
-  });
   mainWindow.on('minimize', () => ipcMain.emit('minimized'));
   mainWindow.on('restore', () => ipcMain.emit('restored'));
   mainWindow.on('closed', () => ipcMain.emit('closed'));
@@ -85,6 +113,15 @@ function createWindow() {
     mainWindow = null;
   });
 }
+
+app.on("second-instance", () => {
+  withMainWindow((window) => {
+    if (window.isMinimized()) {
+      window.restore();
+    }
+    window.focus();
+  });
+});
 
 // This method will be called when Electron has finished
 // initialization and is ready to create browser windows.
@@ -126,7 +163,7 @@ ipcMain.on("initiate-spotify-auth", () => {
     }
   });
 
-  authWindow.loadURL('http://localhost:3000/login');
+  authWindow.loadURL('http://127.0.0.1:3000/login');
 
   // Handle window close
   authWindow.on('closed', () => {
@@ -135,7 +172,7 @@ ipcMain.on("initiate-spotify-auth", () => {
 
   // Listen for the success URL
   authWindow.webContents.on('did-navigate', (event, url) => {
-    if (url.startsWith('http://localhost:3000/callback')) {
+    if (url.startsWith('http://localhost:3000/callback') || url.startsWith('http://127.0.0.1:3000/callback')) {
       // Send success message to main window
       mainWindow.webContents.send('spotify-auth-success');
       // Close auth window after a short delay
@@ -153,7 +190,7 @@ app.on("web-contents-created", (event, contents) => {
   // Prevent all navigation for security reasons except for Spotify auth
   contents.on("will-navigate", (event, navigationUrl) => {
     const parsedUrl = url.parse(navigationUrl);
-    if (!parsedUrl.hostname.includes('spotify.com') && !parsedUrl.hostname.includes('localhost')) {
+    if (!parsedUrl.hostname.includes('spotify.com') && !parsedUrl.hostname.includes('localhost') && !parsedUrl.hostname.includes('127.0.0.1')) {
       event.preventDefault();
     }
   });
@@ -166,7 +203,7 @@ app.on("web-contents-created", (event, contents) => {
       return;
     }
 
-    if (parsedUrl.hostname.includes('spotify.com') || parsedUrl.hostname.includes('localhost')) {
+    if (parsedUrl.hostname.includes('spotify.com') || parsedUrl.hostname.includes('localhost') || parsedUrl.hostname.includes('127.0.0.1')) {
       return;
     }
 

@@ -19,15 +19,31 @@ declare global {
       send: (channel: string, ...args: any[]) => void;
       on: (channel: string, func: (...args: any[]) => void) => void;
     };
+    __webampSpotifySeekToPercent?: (percent: number) => void | Promise<void>;
   }
 }
 
 const ipcRenderer = window.ipcRenderer;
 
 const DEFAULT_DOCUMENT_TITLE = document.title
+const SPOTIFY_SERVER_BASE_URL = 'http://127.0.0.1:3000';
 let spotifyPlayer: SpotifyPlayerInstance | null = null;
 let currentDeviceId: string | null = null;
 let isSpotifyPlaying = false;
+let desiredSpotifyPlayback: 'playing' | 'paused' = 'paused';
+let activeSpotifyUri: string | null = null;
+let pauseRecoveryInProgress = false;
+let lastPauseRecoveryAt = 0;
+let lastAutoAdvancedTrackUri: string | null = null;
+let lastAutoAdvanceAt = 0;
+let playbackRequestSequence = 0;
+let playbackStartPromise: Promise<void> | null = null;
+let playbackStartUri: string | null = null;
+let lastPlaybackCommandAt = 0;
+let lastTrackChangeUri: string | null = null;
+let lastTrackChangeAt = 0;
+let isSyncingSeekBarFromSpotify = false;
+let lastSeekBarUserInteractionAt = 0;
 let playerInitializationPromise: Promise<boolean> | null = null;
 let playbackStateInterval: NodeJS.Timeout | null = null;
 let visualizerInterval: NodeJS.Timeout | null = null;
@@ -42,37 +58,18 @@ const PEAK_HOLD_TIME = 3; // How many frames to hold the peak before it starts f
 let peakHoldCounters: number[] = Array(20).fill(0);
 let canvasRef: HTMLCanvasElement | null = null;
 
-// Add this before webamp initialization
-const DUMMY_AUDIO_URL = 'about:blank';
-
-// Add this constant at the top level
-const SILENT_AUDIO = 'data:audio/mp3;base64,SUQzBAAAAAAAI1RTU0UAAAAPAAADTGF2ZjU4LjIwLjEwMAAAAAAAAAAAAAAA//tUAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWGluZwAAAA8AAAACAAAFbgBtbW1tbW1tbW1tbW1tbW1tbW1tbW1tbW1tbW1tbW1tbW1tbW1tbW1tbW1tbW1tbW1tbW1tbW1tbW1tbW1tbW1t//////////////////////////////////////////////////////////////////8AAAAATGF2YzU4LjM1AAAAAAAAAAAAAAAAJAYAAAAAAAAABWPsO3JQwA==';
-
 // Add these variables at the top level
 let lastSpotifyPosition = 0;
 let isSeekingFromWebamp = false;
-
-// Add a variable to store current track duration
-let currentTrackDuration = 0;
 
 // Add a flag to track resume operations
 let isResumingPlayback = false;
 
 // Add this flag at the top level
-let isTrackChangeInProgress = false;
-
-// Add this flag at the top level
 let lastPlayedTrackUri: string | null = null;
-
-// Add this at the top level
-const dummyAudioCache = new Map<string, string>();
 
 // Add at the top level after imports
 let isOverWebamp = false;
-
-// Add at the top level
-let lastResyncTime = 0;
-const RESYNC_DEBOUNCE_MS = 500; // Minimum time between resyncs
 
 // Add this flag at the top level
 let isPlaybackStarting = false;
@@ -90,6 +87,214 @@ let isVolumeChanging = false;
 let isAuthenticating = false;
 let lastAuthAttempt = 0;
 const AUTH_DEBOUNCE_TIME = 1000; // 1 second debounce
+let suppressPausedStateUntil = 0;
+
+type SpotifyTrackResponseItem = {
+  track: SpotifyTrack;
+};
+
+type PlaySpotifyTrackOptions = {
+  force?: boolean;
+  reason?: string;
+};
+
+type PlaybackUiState = 'playing' | 'paused' | 'stopped';
+
+function createTrackKey(title?: string | null, artist?: string | null): string {
+  return `${title || ''}-${artist || ''}`;
+}
+
+function getPrimaryArtist(track: SpotifyTrack): string {
+  return track.artists?.[0]?.name || 'Unknown Artist';
+}
+
+function getSpotifyTrackFromItem(item: SpotifyTrackResponseItem | { track?: SpotifyTrack } | SpotifyTrack): SpotifyTrack | null {
+  const maybeItem = item as SpotifyTrackResponseItem;
+  const track = maybeItem.track || (item as SpotifyTrack);
+
+  if (!track?.uri || track.uri.startsWith('spotify:local:')) {
+    return null;
+  }
+
+  return track;
+}
+
+function createSpotifySilenceUrl(uri: string, durationMs: number): string {
+  const safeDurationMs = Math.max(1000, Math.floor(durationMs || 1000));
+  return `${SPOTIFY_SERVER_BASE_URL}/silence/${safeDurationMs}.wav?uri=${encodeURIComponent(uri)}`;
+}
+
+function getSpotifyUriFromTrackUrl(urlValue?: string): string | null {
+  if (!urlValue) return null;
+
+  try {
+    return new URL(urlValue).searchParams.get('uri');
+  } catch (error) {
+    return null;
+  }
+}
+
+function createWebampSpotifyTrack(item: SpotifyTrackResponseItem | SpotifyTrack): (WebampTrack & WebampSpotifyTrack) | null {
+  const spotifyTrack = getSpotifyTrackFromItem(item);
+  if (!spotifyTrack) return null;
+
+  const artist = getPrimaryArtist(spotifyTrack);
+  const url = createSpotifySilenceUrl(spotifyTrack.uri, spotifyTrack.duration_ms);
+  const trackKey = createTrackKey(spotifyTrack.name, artist);
+
+  trackUriMap.set(trackKey, spotifyTrack.uri);
+  trackUriMap.set(url, spotifyTrack.uri);
+
+  return {
+    metaData: {
+      artist,
+      title: spotifyTrack.name,
+      spotifyUri: spotifyTrack.uri
+    },
+    url,
+    duration: Math.max(1, Math.floor((spotifyTrack.duration_ms || 1000) / 1000)),
+    length: formatDuration(spotifyTrack.duration_ms || 1000),
+    spotifyUri: spotifyTrack.uri,
+    defaultName: `${spotifyTrack.name} - ${artist}`,
+    isSpotifyTrack: true
+  };
+}
+
+function getSpotifyUriFromWebampTrack(track: any): string | null {
+  const uriFromUrl = getSpotifyUriFromTrackUrl(track?.url);
+  if (uriFromUrl) return uriFromUrl;
+
+  const metadataUri = track?.metaData?.spotifyUri || track?.spotifyUri;
+  if (metadataUri) return metadataUri;
+
+  return trackUriMap.get(createTrackKey(track?.metaData?.title, track?.metaData?.artist)) || null;
+}
+
+function clearPlaybackStateInterval() {
+  if (playbackStateInterval) {
+    clearInterval(playbackStateInterval);
+    playbackStateInterval = null;
+  }
+}
+
+function syncSeekingBarFromSpotify(positionMs: number, durationMs: number) {
+  const seekingBar = document.getElementById('position') as HTMLInputElement;
+  if (!seekingBar || durationMs <= 0 || isSeekingFromWebamp) return;
+
+  isSyncingSeekBarFromSpotify = true;
+  seekingBar.value = ((positionMs / durationMs) * 100).toString();
+  window.setTimeout(() => {
+    isSyncingSeekBarFromSpotify = false;
+  }, 0);
+}
+
+function markSeekBarUserInteraction() {
+  lastSeekBarUserInteractionAt = Date.now();
+}
+
+window.__webampSpotifySeekToPercent = async (percent: number) => {
+  if (!spotifyPlayer || !isSpotifyPlaying) return;
+
+  const clampedPercent = Math.max(0, Math.min(100, percent));
+
+  try {
+    const state = await spotifyPlayer.getCurrentState();
+    if (!state || state.duration <= 0) return;
+
+    const newPosition = Math.floor(state.duration * (clampedPercent / 100));
+    isSeekingFromWebamp = true;
+    await spotifyPlayer.seek(newPosition);
+    lastSpotifyPosition = newPosition;
+    updateTimeDisplay(newPosition);
+    syncWebampElapsedTimeFromSpotify(newPosition);
+    syncSeekingBarFromSpotify(newPosition, state.duration);
+  } catch (error) {
+    console.error('Failed to seek Spotify playback:', error);
+  } finally {
+    isSeekingFromWebamp = false;
+  }
+};
+
+function syncWebampElapsedTimeFromSpotify(positionMs: number) {
+  const store = (webamp as any)?.store;
+  if (!store) return;
+
+  store.dispatch({
+    type: 'UPDATE_TIME_ELAPSED',
+    elapsed: Math.max(0, positionMs / 1000)
+  });
+}
+
+function syncWebampPlaybackStatus(state: PlaybackUiState) {
+  const store = (webamp as any)?.store;
+  if (!store) return;
+
+  const typeByState: Record<PlaybackUiState, string> = {
+    playing: 'IS_PLAYING',
+    paused: 'PAUSE',
+    stopped: 'STOP'
+  };
+
+  store.dispatch({ type: typeByState[state] });
+}
+
+function setSpotifyPlaybackState(isPlaying: boolean, uiState: PlaybackUiState = isPlaying ? 'playing' : 'stopped') {
+  const wasPlaying = isSpotifyPlaying;
+  isSpotifyPlaying = isPlaying;
+  updatePlaybackStateUI(uiState);
+  syncWebampPlaybackStatus(uiState);
+
+  if (isPlaying && !wasPlaying) {
+    startVisualizer();
+  } else if (!isPlaying && wasPlaying) {
+    stopVisualizer();
+  }
+}
+
+async function recoverUnexpectedSpotifyPause(reason: string, state?: SpotifyPlaybackState | null) {
+  if (!spotifyPlayer || desiredSpotifyPlayback !== 'playing' || pauseRecoveryInProgress) {
+    return;
+  }
+
+  if (playbackStartPromise || Date.now() < suppressPausedStateUntil) {
+    console.log('Deferring unexpected pause recovery while playback is starting:', reason);
+    return;
+  }
+
+  const now = Date.now();
+  if (now - lastPauseRecoveryAt < 1200) {
+    return;
+  }
+
+  pauseRecoveryInProgress = true;
+  lastPauseRecoveryAt = now;
+  suppressPausedStateUntil = now + 2500;
+
+  try {
+    console.warn('Recovering unexpected Spotify pause:', reason);
+    const currentUri = state?.track_window?.current_track?.uri;
+
+    if (activeSpotifyUri && currentUri && currentUri !== activeSpotifyUri) {
+      await playSpotifyTrack(activeSpotifyUri, lastSpotifyPosition, { force: true, reason });
+    } else {
+      try {
+        await spotifyPlayer.resume();
+        setSpotifyPlaybackState(true);
+        startPlaybackStateMonitoring();
+      } catch (resumeError) {
+        if (!activeSpotifyUri) {
+          throw resumeError;
+        }
+        console.warn('Spotify resume failed, replaying active URI:', resumeError);
+        await playSpotifyTrack(activeSpotifyUri, lastSpotifyPosition, { force: true, reason });
+      }
+    }
+  } catch (error) {
+    console.error('Failed to recover Spotify playback:', error);
+  } finally {
+    pauseRecoveryInProgress = false;
+  }
+}
 
 // Function to get canvas reference
 function getCanvas(): HTMLCanvasElement | null {
@@ -109,7 +314,7 @@ async function initSpotifyPlayer() {
   playerInitializationPromise = (async () => {
     try {
       // First verify we have a valid token
-      const tokenResponse = await fetch('http://localhost:3000/token');
+      const tokenResponse = await fetch(`${SPOTIFY_SERVER_BASE_URL}/token`);
       const tokenData = await tokenResponse.json();
       if (tokenData.error) {
         throw new Error('No valid token available');
@@ -146,7 +351,7 @@ async function initSpotifyPlayer() {
               name: 'Webamp Desktop',
               getOAuthToken: async (cb: (token: string) => void) => {
                 try {
-                  const response = await fetch('http://localhost:3000/token');
+                  const response = await fetch(`${SPOTIFY_SERVER_BASE_URL}/token`);
                   const data = await response.json();
                   if (data.error) {
                     console.error('Failed to get token:', data.error);
@@ -194,7 +399,7 @@ async function initSpotifyPlayer() {
 
               // Immediately set this device as active
               try {
-                const tokenResponse = await fetch('http://localhost:3000/token');
+                const tokenResponse = await fetch(`${SPOTIFY_SERVER_BASE_URL}/token`);
                 const tokenData = await tokenResponse.json();
                 if (!tokenData.error) {
                   await fetch('https://api.spotify.com/v1/me/player', {
@@ -246,11 +451,23 @@ async function initSpotifyPlayer() {
             });
 
             // Add state change listener
-            spotifyPlayer.addListener('player_state_changed', async (state: SpotifyPlaybackState) => {
+            spotifyPlayer.addListener('player_state_changed', async (state: SpotifyPlaybackState | null) => {
               console.log('Playback state changed:', state);
               if (state) {
+	                if (state.paused && desiredSpotifyPlayback === 'playing') {
+	                  if (playbackStartPromise || Date.now() < suppressPausedStateUntil) {
+	                    console.log('Ignoring transient paused state during playback start');
+	                    return;
+	                  }
+
+	                  desiredSpotifyPlayback = 'paused';
+	                  setSpotifyPlaybackState(false, 'paused');
+	                  clearPlaybackStateInterval();
+	                  return;
+	                }
+
                 const wasPlaying = isSpotifyPlaying;
-                isSpotifyPlaying = !state.paused;
+                setSpotifyPlaybackState(!state.paused);
 
                 // Handle initial playback
                 if (isSpotifyPlaying && !wasPlaying) {
@@ -267,23 +484,14 @@ async function initSpotifyPlayer() {
                   // If this is the first position update after initial playback
                   if (state.position > 0 && !initialPlaybackHandled) {
                     initialPlaybackHandled = true;
-                    // Update Webamp's position to match Spotify
-                    const seekBar = document.getElementById('position') as HTMLInputElement;
-                    if (seekBar) {
-                      const percentage = (state.position / state.duration) * 100;
-                      seekBar.value = percentage.toString();
-                      seekBar.dispatchEvent(new Event('change', { bubbles: true }));
-                    }
+                    syncSeekingBarFromSpotify(state.position, state.duration);
                   }
                 }
 
                 if (isSpotifyPlaying) {
                   startPlaybackStateMonitoring();
                 } else {
-                  if (playbackStateInterval) {
-                    clearInterval(playbackStateInterval);
-                    playbackStateInterval = null;
-                  }
+                  clearPlaybackStateInterval();
                   document.title = DEFAULT_DOCUMENT_TITLE;
                 }
               }
@@ -336,8 +544,51 @@ function formatDuration(ms: number): string {
 }
 
 // Function to play a Spotify track
-async function playSpotifyTrack(uri: string, startPosition: number = 0) {
+async function playSpotifyTrack(uri: string, startPosition: number = 0, options: PlaySpotifyTrackOptions = {}) {
+  const now = Date.now();
+
+  if (!options.force && playbackStartPromise && playbackStartUri === uri) {
+    console.log('Joining in-flight Spotify playback request:', { uri, reason: options.reason });
+    return playbackStartPromise;
+  }
+
+  if (
+    !options.force &&
+    activeSpotifyUri === uri &&
+    isSpotifyPlaying &&
+    now - lastPlaybackCommandAt < 2500
+  ) {
+    console.log('Ignoring duplicate Spotify playback request:', { uri, reason: options.reason });
+    return;
+  }
+
+  const requestId = ++playbackRequestSequence;
+  playbackStartUri = uri;
+  lastPlaybackCommandAt = now;
+
+  const request = performSpotifyTrackPlayback(uri, startPosition, requestId, options);
+  playbackStartPromise = request;
+
+  try {
+    await request;
+  } finally {
+    if (playbackStartPromise === request) {
+      playbackStartPromise = null;
+      playbackStartUri = null;
+    }
+  }
+}
+
+async function performSpotifyTrackPlayback(
+  uri: string,
+  startPosition: number,
+  requestId: number,
+  options: PlaySpotifyTrackOptions
+) {
   console.log('Starting playback...', { uri, startPosition });
+  desiredSpotifyPlayback = 'playing';
+  activeSpotifyUri = uri;
+  lastAutoAdvancedTrackUri = null;
   
   // Check if this is a local file
   if (uri.startsWith('spotify:local:')) {
@@ -363,10 +614,18 @@ async function playSpotifyTrack(uri: string, startPosition: number = 0) {
   }
   
   // Get fresh token
-  const tokenResponse = await fetch('http://localhost:3000/token');
+  const tokenResponse = await fetch(`${SPOTIFY_SERVER_BASE_URL}/token`);
   const { token } = await tokenResponse.json();
 
   try {
+    isPlaybackStarting = true;
+    suppressPausedStateUntil = Date.now() + 2000;
+
+    if (requestId !== playbackRequestSequence) {
+      console.log('Skipping stale Spotify playback request before state lookup:', { uri, requestId });
+      return;
+    }
+
     // Get current playback state
     const stateResponse = await fetch('https://api.spotify.com/v1/me/player', {
       headers: {
@@ -379,6 +638,11 @@ async function playSpotifyTrack(uri: string, startPosition: number = 0) {
       state = await stateResponse.json();
     }
     console.log('Current playback state:', state);
+
+    if (requestId !== playbackRequestSequence) {
+      console.log('Skipping stale Spotify playback request before transfer:', { uri, requestId });
+      return;
+    }
 
     // Transfer playback to our device first
     console.log('Transferring playback to our device...');
@@ -410,6 +674,11 @@ async function playSpotifyTrack(uri: string, startPosition: number = 0) {
       body.position_ms = startPosition;
     }
 
+    if (requestId !== playbackRequestSequence) {
+      console.log('Skipping stale Spotify playback request before play:', { uri, requestId });
+      return;
+    }
+
     // Make the playback request
     console.log('Starting playback on device:', currentDeviceId);
     const response = await fetch(`https://api.spotify.com/v1/me/player/play?device_id=${currentDeviceId}`, {
@@ -431,12 +700,8 @@ async function playSpotifyTrack(uri: string, startPosition: number = 0) {
         // If we get a 403 error, automatically skip to next track
         if (response.status === 403) {
           console.log('Track unavailable (403), skipping to next track...');
-          // Find and click the next button
-          const nextButton = document.querySelector('#main-window #next') as HTMLElement;
-          if (nextButton) {
-            nextButton.click();
-            return; // Exit the function early
-          }
+          advanceWebampTrack('next');
+          return; // Exit the function early
         }
       } catch (e) {
         console.error('Could not parse error response:', e);
@@ -444,9 +709,22 @@ async function playSpotifyTrack(uri: string, startPosition: number = 0) {
       throw new Error(`Playback failed: ${errorMessage}`);
     }
 
-    isSpotifyPlaying = true;
+    if (requestId !== playbackRequestSequence && !options.force) {
+      console.log('Ignoring stale Spotify playback completion:', { uri, requestId });
+      return;
+    }
+
+    setSpotifyPlaybackState(true);
+    startPlaybackStateMonitoring();
+    setTimeout(() => {
+      isPlaybackStarting = false;
+    }, 1000);
     console.log('Playback started successfully');
   } catch (error) {
+    isPlaybackStarting = false;
+    if (activeSpotifyUri === uri) {
+      desiredSpotifyPlayback = 'paused';
+    }
     console.error('Error in playback sequence:', error);
     throw error;
   }
@@ -455,116 +733,13 @@ async function playSpotifyTrack(uri: string, startPosition: number = 0) {
 // Function to load Spotify playlists
 async function loadSpotifyPlaylists(): Promise<SpotifyPlaylist[]> {
   try {
-    const response = await fetch('http://localhost:3000/playlists');
+    const response = await fetch(`${SPOTIFY_SERVER_BASE_URL}/playlists`);
     const data = await response.json();
     if (data.error) return [];
     return data.items;
   } catch (error) {
     console.error('Error loading playlists:', error);
     return [];
-  }
-}
-
-// Add this function to create a minimal WAV file with correct duration
-function createSilentWavFile(durationMs: number): string {
-  // Use minimal sample rate and single channel to reduce size
-  const sampleRate = 8000; // Minimum sample rate that still works reliably
-  const channels = 1;
-  const bitsPerSample = 8;
-  const numSamples = Math.ceil(sampleRate * (durationMs / 1000));
-  
-  // Calculate sizes
-  const dataSize = numSamples * channels * (bitsPerSample / 8);
-  const fileSize = 44 + dataSize; // 44 bytes for WAV header
-  
-  // Create buffer
-  const buffer = new ArrayBuffer(fileSize);
-  const view = new DataView(buffer);
-  
-  // WAV header
-  const writeString = (offset: number, string: string) => {
-    for (let i = 0; i < string.length; i++) {
-      view.setUint8(offset + i, string.charCodeAt(i));
-    }
-  };
-  
-  // RIFF chunk descriptor
-  writeString(0, 'RIFF');
-  view.setUint32(4, fileSize - 8, true);
-  writeString(8, 'WAVE');
-  
-  // fmt sub-chunk
-  writeString(12, 'fmt ');
-  view.setUint32(16, 16, true); // fmt chunk size
-  view.setUint16(20, 1, true); // PCM format
-  view.setUint16(22, channels, true);
-  view.setUint32(24, sampleRate, true);
-  view.setUint32(28, sampleRate * channels * (bitsPerSample / 8), true); // byte rate
-  view.setUint16(32, channels * (bitsPerSample / 8), true); // block align
-  view.setUint16(34, bitsPerSample, true);
-  
-  // data sub-chunk
-  writeString(36, 'data');
-  view.setUint32(40, dataSize, true);
-  
-  // Fill with silence (128 for 8-bit audio)
-  for (let i = 44; i < fileSize; i++) {
-    view.setUint8(i, 128);
-  }
-  
-  // Create blob and URL
-  const blob = new Blob([buffer], { type: 'audio/wav' });
-  return URL.createObjectURL(blob);
-}
-
-// Function to load tracks from a Spotify playlist
-async function loadPlaylistTracks(playlistId: string): Promise<(WebampTrack & WebampSpotifyTrack)[]> {
-  console.log('Loading playlist tracks for ID:', playlistId);
-  try {
-    const response = await fetch(`http://localhost:3000/playlist/${playlistId}/tracks`);
-    const data = await response.json();
-    if (data.error) {
-      console.error('Error in playlist data:', data.error);
-      return [] as (WebampTrack & WebampSpotifyTrack)[];
-    }
-    
-    console.log('Raw playlist tracks:', data.items);
-    
-    const tracks = data.items.map((item: any) => {
-      console.log('Processing track item:', item);
-      
-      // Create a unique key for this track
-      const trackKey = `${item.track.name}-${item.track.artists[0].name}`;
-      
-      // Store the URI in our map
-      trackUriMap.set(trackKey, item.track.uri);
-      
-      // Create silent WAV file with correct duration
-      const silentAudioUrl = createSilentWavFile(item.track.duration_ms);
-      
-      const track: WebampTrack & WebampSpotifyTrack = {
-        metaData: {
-          artist: item.track.artists[0].name,
-          title: item.track.name,
-          spotifyUri: item.track.uri
-        },
-        url: silentAudioUrl,
-        duration: Math.floor(item.track.duration_ms / 1000),
-        length: formatDuration(item.track.duration_ms),
-        spotifyUri: item.track.uri,
-        defaultName: `${item.track.name} - ${item.track.artists[0].name}`,
-        isSpotifyTrack: true
-      };
-      
-      console.log('Created track object:', track);
-      return track;
-    });
-    
-    console.log('Final tracks array:', tracks);
-    return tracks;
-  } catch (error) {
-    console.error('Error loading playlist tracks:', error);
-    return [] as (WebampTrack & WebampSpotifyTrack)[];
   }
 }
 
@@ -616,20 +791,11 @@ async function showPlaylistSelector(ejectButton: Element): Promise<void> {
     // Remove dropdown immediately
     document.body.removeChild(wrapper);
 
-    // Disable all playback controls
-    //disablePlaybackControls();
+    disablePlaybackControls();
 
     // Stop current playback
     if (spotifyPlayer && isSpotifyPlaying) {
-      await spotifyPlayer.pause();
-      isSpotifyPlaying = false;
-      updatePlaybackStateUI(false);
-      
-      // Pause dummy audio
-      const audioElements = document.querySelectorAll('audio');
-      audioElements.forEach(audio => {
-        audio.pause();
-      });
+      await stopSpotifyPlayback();
     }
 
     // Create loading indicator
@@ -645,169 +811,51 @@ async function showPlaylistSelector(ejectButton: Element): Promise<void> {
     document.body.appendChild(loadingDiv);
 
     try {
-      // Function to process streamed tracks
-      const processStreamedTracks = async (url: string) => {
-        // Clear existing playlist first
+      const loadTracksIntoWebamp = async (url: string) => {
         loadingDiv.textContent = 'Clearing current playlist...';
         await webamp.setTracksToPlay([]);
 
-        // Load tracks with streaming response
-        loadingDiv.textContent = 'Starting to load tracks...';
+        loadingDiv.textContent = 'Loading tracks...';
         const response = await fetch(url);
-        const reader = response.body?.getReader();
-        if (!reader) throw new Error('No reader available');
+        const data = await response.json();
+        if (!response.ok || data.error) {
+          throw new Error(data.error || `Failed to load tracks: ${response.status}`);
+        }
 
-        let buffer = '';
+        const items = data.items || [];
+        const totalTracks = data.total || items.length;
+        const batchSize = 200;
+        let batch: (WebampTrack & WebampSpotifyTrack)[] = [];
         let totalProcessed = 0;
-        let totalTracks = 0;
-        let currentBatch = [];
-        let isFirstChunk = true;
 
-        while (true) {
-          const { done, value } = await reader.read();
-          
-          if (value) {
-            const chunk = new TextDecoder().decode(value);
-            
-            // Handle the first chunk specially
-            if (isFirstChunk) {
-              buffer = chunk;
-              isFirstChunk = false;
-              
-              // Extract total from the first chunk
-              const totalMatch = buffer.match(/"total":(\d+)/);
-              if (totalMatch) {
-                totalTracks = parseInt(totalMatch[1], 10);
-                loadingDiv.textContent = `Found ${totalTracks} tracks to load`;
-                
-                // Remove everything up to the items array
-                const itemsStart = buffer.indexOf('"items":[') + 8;
-                buffer = buffer.slice(itemsStart);
-              }
-            } else {
-              buffer += chunk;
-            }
+        loadingDiv.textContent = `${data.cached ? 'Using cached' : 'Processing'} tracks... 0/${totalTracks}`;
 
-            // Process complete track objects
-            while (true) {
-              const trackStart = buffer.indexOf('{"added_at"');
-              if (trackStart === -1) break;
-              
-              // Find the end of the track object
-              let trackEnd = -1;
-              let depth = 0;
-              let inString = false;
-              let escape = false;
-              
-              for (let i = trackStart; i < buffer.length; i++) {
-                const char = buffer[i];
-                
-                if (escape) {
-                  escape = false;
-                  continue;
-                }
-                
-                if (char === '\\') {
-                  escape = true;
-                  continue;
-                }
-                
-                if (char === '"' && !escape) {
-                  inString = !inString;
-                  continue;
-                }
-                
-                if (!inString) {
-                  if (char === '{') depth++;
-                  if (char === '}') {
-                    depth--;
-                    if (depth === 0) {
-                      trackEnd = i + 1;
-                      break;
-                    }
-                  }
-                }
-              }
-              
-              if (trackEnd === -1) break; // Wait for more data
-              
-              try {
-                const trackJson = buffer.slice(trackStart, trackEnd);
-                const item = JSON.parse(trackJson);
-                
-                // Skip local files
-                if (item.track.uri?.startsWith('spotify:local:')) {
-                  console.log('Skipping local file:', item.track.name);
-                  buffer = buffer.slice(trackEnd);
-                  if (buffer.startsWith(',')) {
-                    buffer = buffer.slice(1);
-                  }
-                  continue;
-                }
+        for (const item of items) {
+          const track = createWebampSpotifyTrack(item);
+          if (!track) continue;
 
-                // Create track object
-                const trackKey = `${item.track.name}-${item.track.artists[0].name}`;
-                trackUriMap.set(trackKey, item.track.uri);
-                
-                const track = {
-                  metaData: {
-                    artist: item.track.artists[0].name,
-                    title: item.track.name,
-                    spotifyUri: item.track.uri
-                  },
-                  url: createSilentWavFile(item.track.duration_ms),
-                  duration: Math.floor(item.track.duration_ms / 1000),
-                  length: formatDuration(item.track.duration_ms),
-                  spotifyUri: item.track.uri,
-                  defaultName: `${item.track.name} - ${item.track.artists[0].name}`,
-                  isSpotifyTrack: true
-                };
-                
-                currentBatch.push(track);
-                totalProcessed++;
-                
-                // Update progress
-                loadingDiv.textContent = `Processing tracks... ${totalProcessed}/${totalTracks}`;
-                
-                // Add batch of 50 tracks to playlist
-                if (currentBatch.length >= 50) {
-                  await webamp.appendTracks(currentBatch);
-                  currentBatch = [];
-                  // Let UI update
-                  await new Promise(resolve => setTimeout(resolve, 0));
-                }
-                
-                // Remove the processed track and the following comma if present
-                buffer = buffer.slice(trackEnd);
-                if (buffer.startsWith(',')) {
-                  buffer = buffer.slice(1);
-                }
-              } catch (error) {
-                console.error('Error processing track:', error);
-                // Skip to the next track
-                buffer = buffer.slice(trackEnd);
-                if (buffer.startsWith(',')) {
-                  buffer = buffer.slice(1);
-                }
-              }
-            }
-          }
-          
-          if (done) {
-            // Add any remaining tracks
-            if (currentBatch.length > 0) {
-              loadingDiv.textContent = `Adding final ${currentBatch.length} tracks...`;
-              await webamp.appendTracks(currentBatch);
-            }
-            break;
+          batch.push(track);
+          totalProcessed++;
+
+          if (batch.length >= batchSize) {
+            webamp.appendTracks(batch);
+            loadingDiv.textContent = `Processing tracks... ${totalProcessed}/${totalTracks}`;
+            batch = [];
+            await new Promise(resolve => setTimeout(resolve, 0));
           }
         }
+
+        if (batch.length > 0) {
+          webamp.appendTracks(batch);
+        }
+
+        loadingDiv.textContent = `Loaded ${totalProcessed}/${totalTracks} tracks`;
       };
 
       if (select.value === 'liked') {
-        await processStreamedTracks('http://localhost:3000/liked');
+        await loadTracksIntoWebamp(`${SPOTIFY_SERVER_BASE_URL}/liked`);
       } else {
-        await processStreamedTracks(`http://localhost:3000/playlist/${select.value}`);
+        await loadTracksIntoWebamp(`${SPOTIFY_SERVER_BASE_URL}/playlist/${select.value}`);
       }
     } catch (error) {
       console.error('Error loading tracks:', error);
@@ -882,7 +930,7 @@ function initSpotifyAuth() {
     setTimeout(async () => {
       try {
         // Verify we have a valid token before initializing player
-        const tokenResponse = await fetch('http://localhost:3000/token');
+        const tokenResponse = await fetch(`${SPOTIFY_SERVER_BASE_URL}/token`);
         const tokenData = await tokenResponse.json();
         if (tokenData.error) {
           console.error('No valid token available after auth');
@@ -927,90 +975,6 @@ function debugLogTrack(track: any) {
   });
 }
 
-// Function to prevent audio errors
-function preventAudioErrors() {
-  const audioElements = document.querySelectorAll('audio');
-  audioElements.forEach(audio => {
-    audio.addEventListener('error', (e) => {
-      e.preventDefault();
-      e.stopPropagation();
-    }, true);
-    
-    // Prevent loading attempts
-    audio.addEventListener('loadstart', (e) => {
-      e.preventDefault();
-      e.stopPropagation();
-    }, true);
-  });
-}
-
-// Add this function to generate a silent audio file with specific duration
-function generateSilentAudio(durationMs: number): string {
-  const audioContext = new (window.AudioContext || (window as any).webkitAudioContext)();
-  const sampleRate = audioContext.sampleRate;
-  const numberOfChannels = 1;
-  const frameCount = Math.ceil(sampleRate * (durationMs / 1000));
-  
-  const audioBuffer = audioContext.createBuffer(numberOfChannels, frameCount, sampleRate);
-  const channelData = audioBuffer.getChannelData(0);
-  // Fill with silence (zeros)
-  for (let i = 0; i < frameCount; i++) {
-    channelData[i] = 0;
-  }
-
-  // Convert to WAV
-  const wavData = audioBufferToWav(audioBuffer);
-  const blob = new Blob([wavData], { type: 'audio/wav' });
-  return URL.createObjectURL(blob);
-}
-
-// Helper function to convert AudioBuffer to WAV format
-function audioBufferToWav(buffer: AudioBuffer): ArrayBuffer {
-  const numberOfChannels = buffer.numberOfChannels;
-  const sampleRate = buffer.sampleRate;
-  const format = 1; // PCM
-  const bitDepth = 16;
-  const bytesPerSample = bitDepth / 8;
-  const blockAlign = numberOfChannels * bytesPerSample;
-  const byteRate = sampleRate * blockAlign;
-  const dataSize = buffer.length * blockAlign;
-  const headerSize = 44;
-  const wavData = new ArrayBuffer(headerSize + dataSize);
-  const view = new DataView(wavData);
-
-  // WAV header
-  writeString(view, 0, 'RIFF');
-  view.setUint32(4, 36 + dataSize, true);
-  writeString(view, 8, 'WAVE');
-  writeString(view, 12, 'fmt ');
-  view.setUint32(16, 16, true);
-  view.setUint16(20, format, true);
-  view.setUint16(22, numberOfChannels, true);
-  view.setUint32(24, sampleRate, true);
-  view.setUint32(28, byteRate, true);
-  view.setUint16(32, blockAlign, true);
-  view.setUint16(34, bitDepth, true);
-  writeString(view, 36, 'data');
-  view.setUint32(40, dataSize, true);
-
-  // Write audio data
-  const channelData = buffer.getChannelData(0);
-  let offset = 44;
-  for (let i = 0; i < buffer.length; i++) {
-    const sample = Math.max(-1, Math.min(1, channelData[i]));
-    view.setInt16(offset, sample < 0 ? sample * 0x8000 : sample * 0x7FFF, true);
-    offset += 2;
-  }
-
-  return wavData;
-}
-
-function writeString(view: DataView, offset: number, string: string) {
-  for (let i = 0; i < string.length; i++) {
-    view.setUint8(offset + i, string.charCodeAt(i));
-  }
-}
-
 const webamp = new Webamp({
   availableSkins: [
     { url: './skins/base-2.91.wsz', name: 'Base v2.91' },
@@ -1035,115 +999,43 @@ const unsubscribeOnClose = webamp.onClose(() => {
   unsubscribeOnClose()
 })
 
-// Function to update track duration
-function updateTrackDuration(track: any) {
-  if (track && track.durationOverride) {
-    // Force the duration to our override value
-    Object.defineProperty(track, 'duration', {
-      value: track.durationOverride,
-      writable: false,
-      configurable: false
-    });
-  }
-}
-
-// Function to handle time synchronization
-function synchronizePlaybackTime(track: any, audio: HTMLAudioElement) {
-  if (!track?.isSpotifyTrack || !spotifyPlayer) return;
-
-  // Listen for Webamp's time updates
-  audio.addEventListener('timeupdate', async (e) => {
-    if (!isSpotifyPlaying || isPlaybackStarting || isResumingPlayback) return;
-
-    const webampTime = Math.floor(audio.currentTime * 1000); // Convert to ms
-    const timeDiff = Math.abs(webampTime - lastSpotifyPosition);
-
-    // If we're near the start of the track (first 2 seconds), allow larger differences
-    const isNearStart = webampTime < 2000 || lastSpotifyPosition < 2000;
-    
-    // Increase tolerance for time differences
-    const toleranceMs = isNearStart ? 2000 : 2500;
-
-    // Only seek if the difference is significant and we're not already seeking
-    if (timeDiff > toleranceMs && !isSeekingFromWebamp && !isNearStart) {
-      try {
-        isSeekingFromWebamp = true;
-        await spotifyPlayer.seek(webampTime);
-        lastSpotifyPosition = webampTime;
-      } catch (error) {
-        console.error('Failed to seek Spotify playback:', error);
-      } finally {
-        isSeekingFromWebamp = false;
-      }
-    }
-  });
-}
-
-// Add this function to verify track synchronization
-async function verifyTrackSync(track: any) {
-  if (!track?.isSpotifyTrack || !spotifyPlayer) return;
-
-  try {
-    const state = await spotifyPlayer.getCurrentState();
-    if (!state?.track_window?.current_track) return;
-
-    const spotifyTrack = state.track_window.current_track;
-    const webampTrackKey = `${track.metaData.title}-${track.metaData.artist}`;
-    const spotifyTrackKey = `${spotifyTrack.name}-${spotifyTrack.artists[0].name}`;
-
-    // If tracks are out of sync
-    if (webampTrackKey !== spotifyTrackKey) {
-      console.log('Track out of sync, realigning...', {
-        webamp: webampTrackKey,
-        spotify: spotifyTrackKey
-      });
-
-      // Find the correct track in Webamp's playlist
-      const playlist = document.querySelector('#playlist-window #playlist');
-      if (playlist) {
-        const tracks = Array.from(playlist.children);
-        const correctTrack = tracks.find(t => {
-          const title = t.querySelector('.track-title')?.textContent || '';
-          const artist = t.querySelector('.track-artist')?.textContent || '';
-          return `${title}-${artist}` === spotifyTrackKey;
-        });
-
-        if (correctTrack) {
-          // Double click to play the correct track
-          const event = new MouseEvent('dblclick', {
-            bubbles: true,
-            cancelable: true,
-            view: window
-          });
-          correctTrack.dispatchEvent(event);
-        }
-      }
-    }
-  } catch (error) {
-    console.error('Error verifying track sync:', error);
-  }
-}
-
-// Add this function to handle synchronized playback start
-async function startSynchronizedPlayback(track: any, spotifyUri: string) {
-  // Pause Webamp's audio elements first
-  const audioElements = document.querySelectorAll('audio');
-  audioElements.forEach(audio => {
-    audio.pause();
-  });
-
-  // Start Spotify playback
+async function startSynchronizedPlayback(spotifyUri: string) {
   console.log('Starting Spotify playback...');
   await playSpotifyTrack(spotifyUri, 0);
+  setSpotifyPlaybackState(true);
+  startPlaybackStateMonitoring();
+}
 
-  // Wait a bit to ensure Spotify has started
-  await new Promise(resolve => setTimeout(resolve, 100));
+function advanceWebampTrack(direction: 'next' | 'previous') {
+  desiredSpotifyPlayback = 'playing';
+  if (direction === 'next') {
+    (webamp as any).nextTrack();
+  } else {
+    (webamp as any).previousTrack();
+  }
+}
 
-  // Now start Webamp's playback
-  console.log('Starting Webamp playback...');
-  audioElements.forEach(audio => {
-    audio.play();
-  });
+async function pauseSpotifyPlayback() {
+  desiredSpotifyPlayback = 'paused';
+
+  if (spotifyPlayer) {
+    await spotifyPlayer.pause();
+  }
+
+  setSpotifyPlaybackState(false, 'paused');
+  clearPlaybackStateInterval();
+}
+
+async function stopSpotifyPlayback() {
+  desiredSpotifyPlayback = 'paused';
+  activeSpotifyUri = null;
+  lastPlayedTrackUri = null;
+  lastSpotifyPosition = 0;
+  isSeekingFromWebamp = false;
+  document.title = DEFAULT_DOCUMENT_TITLE;
+  syncWebampElapsedTimeFromSpotify(0);
+
+  await pauseSpotifyPlayback();
 }
 
 // Modify the onTrackDidChange handler
@@ -1157,24 +1049,37 @@ webamp.onTrackDidChange((track: any) => {
     return;
   }
 
-  // Reset position tracking
-  lastSpotifyPosition = 0;
-  isSeekingFromWebamp = false;
-  currentTrackDuration = track?.duration * 1000 || 0;
-  isPlaybackStarting = true; // Add this flag to prevent initial seeking
-
   if (!track || !track.metaData) {
     console.log('No track or metadata');
     return;
   }
 
-  // Look up the URI from our map
-  const trackKey = `${track.metaData.title}-${track.metaData.artist}`;
-  const spotifyUri = trackUriMap.get(trackKey);
+  const trackKey = createTrackKey(track.metaData.title, track.metaData.artist);
+  const spotifyUri = getSpotifyUriFromWebampTrack(track);
+  const now = Date.now();
   
   console.log('Track lookup:', { trackKey, spotifyUri });
 
   if (spotifyUri) {
+    if (spotifyUri === activeSpotifyUri && spotifyUri === lastPlayedTrackUri) {
+      console.log('Ignoring Webamp status-only track event for active Spotify track:', { spotifyUri });
+      return;
+    }
+
+    if (spotifyUri === lastTrackChangeUri && now - lastTrackChangeAt < 1200) {
+      console.log('Ignoring duplicate Webamp track change event:', { spotifyUri });
+      return;
+    }
+
+    lastTrackChangeUri = spotifyUri;
+    lastTrackChangeAt = now;
+
+	    // Reset position tracking only after accepting a real track change.
+	    lastSpotifyPosition = 0;
+	    isSeekingFromWebamp = false;
+	    isPlaybackStarting = true;
+	    syncWebampElapsedTimeFromSpotify(0);
+
     console.log('Spotify track detected:', {
       name: track.metaData.title,
       artist: track.metaData.artist,
@@ -1186,36 +1091,15 @@ webamp.onTrackDidChange((track: any) => {
     // Update document title
     document.title = `${track.metaData.title} - ${track.metaData.artist}` || DEFAULT_DOCUMENT_TITLE;
 
-    // Generate dummy audio file if not cached
-    if (!dummyAudioCache.has(spotifyUri) && track.durationMs) {
-      const dummyAudioUrl = generateSilentAudio(track.durationMs);
-      dummyAudioCache.set(spotifyUri, dummyAudioUrl);
-      
-      // Update track's URL
-      const audioElements = document.querySelectorAll('audio');
-      audioElements.forEach(audio => {
-        if (audio.src === SILENT_AUDIO) {
-          audio.src = dummyAudioUrl;
-        }
-      });
-    }
-
     // Only start playback if this is a new track
     if (spotifyUri !== lastPlayedTrackUri) {
       lastPlayedTrackUri = spotifyUri;
-      startSynchronizedPlayback(track, spotifyUri);
+      startSynchronizedPlayback(spotifyUri).catch((error) => {
+        console.error('Failed to start synchronized playback:', error);
+        desiredSpotifyPlayback = 'paused';
+        setSpotifyPlaybackState(false);
+      });
     }
-
-    // Set up audio elements
-    const audioElements = document.querySelectorAll('audio');
-    audioElements.forEach(audio => {
-      audio.volume = 0;
-      // Use cached dummy audio if available
-      if (dummyAudioCache.has(spotifyUri)) {
-        audio.src = dummyAudioCache.get(spotifyUri)!;
-      }
-      synchronizePlaybackTime(track, audio);
-    });
 
     // Reset playback starting flag after a short delay
     setTimeout(() => {
@@ -1225,11 +1109,11 @@ webamp.onTrackDidChange((track: any) => {
 });
 
 // Function to update play/stop state in UI
-function updatePlaybackStateUI(isPlaying: boolean) {
+function updatePlaybackStateUI(state: PlaybackUiState) {
   const mainWindow = document.getElementById('main-window');
   if (mainWindow) {
-    const classes = mainWindow.className.split(' ').filter(c => c !== 'play' && c !== 'stop');
-    classes.push(isPlaying ? 'play' : 'stop');
+    const classes = mainWindow.className.split(' ').filter(c => c !== 'play' && c !== 'pause' && c !== 'stop');
+    classes.push(state === 'playing' ? 'play' : state === 'paused' ? 'pause' : 'stop');
     mainWindow.className = classes.join(' ');
   }
 }
@@ -1581,9 +1465,7 @@ function stopVisualizer() {
 
 // Function to start playback state monitoring
 function startPlaybackStateMonitoring() {
-  if (playbackStateInterval) {
-    clearInterval(playbackStateInterval);
-  }
+  clearPlaybackStateInterval();
 
   playbackStateInterval = setInterval(async () => {
     if (!spotifyPlayer || !isSpotifyPlaying) return;
@@ -1591,14 +1473,13 @@ function startPlaybackStateMonitoring() {
     try {
       const state = await spotifyPlayer.getCurrentState();
       if (state) {
-        // Update current track duration
-        currentTrackDuration = state.duration;
-        
         // Only update if we're not seeking from Webamp
         if (!isSeekingFromWebamp) {
           lastSpotifyPosition = state.position;
         }
-        updatePlaybackStateUI(!state.paused);
+        if (!state.paused) {
+          setSpotifyPlaybackState(true);
+        }
         
         // Update document title with current track info
         if (state.track_window?.current_track) {
@@ -1606,56 +1487,49 @@ function startPlaybackStateMonitoring() {
           document.title = `${name} - ${artists[0].name}`;
         }
 
+	        const stateTrackUri = state.track_window?.current_track?.uri || null;
+	        updateTimeDisplay(state.position);
+	        syncWebampElapsedTimeFromSpotify(state.position);
+	        syncSeekingBarFromSpotify(state.position, state.duration);
+
         // Check if track has ended (position is at or very close to duration)
         if (state.position >= state.duration - 500) { // 500ms buffer
+          const now = Date.now();
+          if (stateTrackUri === lastAutoAdvancedTrackUri && now - lastAutoAdvanceAt < 5000) {
+            return;
+          }
+
+          lastAutoAdvancedTrackUri = stateTrackUri;
+          lastAutoAdvanceAt = now;
+
           // Get the next track button and playlist
-          const nextButton = document.querySelector('#main-window #next') as HTMLElement;
           const playlist = document.querySelector('#playlist-window #playlist');
           
-          if (nextButton && playlist) {
-            // Check if there's a next track in the playlist
-            const currentTrack = playlist.querySelector('.selected');
-            const nextTrack = currentTrack?.nextElementSibling;
-            
-            if (nextTrack) {
-              // Click next only if there's actually a next track
-              console.log('Track ending, moving to next track');
-              nextButton.click();
+          if (playlist) {
+            console.log('Track ending, moving to next track');
+            advanceWebampTrack('next');
               
-              // Wait a short moment and ensure playback continues
-              setTimeout(async () => {
-                const newState = await spotifyPlayer.getCurrentState();
-                if (newState?.paused) {
-                  await spotifyPlayer.resume();
-                  isSpotifyPlaying = true;
-                  updatePlaybackStateUI(true);
-                }
-              }, 500);
-            } else {
-              // If no next track, handle end of playlist
-              console.log('End of playlist reached');
-              isSpotifyPlaying = false;
-              updatePlaybackStateUI(false);
-              stopVisualizer();
-              if (playbackStateInterval) {
-                clearInterval(playbackStateInterval);
-                playbackStateInterval = null;
-              }
-            }
-          }
-        }
+	            // Spotify will report the new state through player_state_changed.
+	          }
+	        }
 
         // If track has been paused externally
-        if (state.paused && isSpotifyPlaying) {
-          isSpotifyPlaying = false;
-          document.title = DEFAULT_DOCUMENT_TITLE;
-          updatePlaybackStateUI(false);
-          stopVisualizer();
-          if (playbackStateInterval) {
-            clearInterval(playbackStateInterval);
-            playbackStateInterval = null;
-          }
-        }
+	        if (state.paused && isSpotifyPlaying) {
+	          if (desiredSpotifyPlayback === 'playing') {
+	            if (playbackStartPromise || Date.now() < suppressPausedStateUntil) {
+	              return;
+	            }
+
+	            desiredSpotifyPlayback = 'paused';
+	            setSpotifyPlaybackState(false, 'paused');
+	            clearPlaybackStateInterval();
+	            return;
+	          }
+
+	          document.title = DEFAULT_DOCUMENT_TITLE;
+	          setSpotifyPlaybackState(false, 'paused');
+	          clearPlaybackStateInterval();
+	        }
       }
     } catch (error) {
       console.error('Error getting playback state:', error);
@@ -1673,20 +1547,17 @@ window.addEventListener('beforeunload', () => {
     clearInterval(visualizerInterval);
     visualizerInterval = null;
   }
-  if (playbackStateInterval) {
-    clearInterval(playbackStateInterval);
-    playbackStateInterval = null;
-  }
+  clearPlaybackStateInterval();
 });
 
 // Update play/pause functions
 window.webampPlay = async function () {
   if (spotifyPlayer && !isSpotifyPlaying) {
     try {
+      desiredSpotifyPlayback = 'playing';
       await spotifyPlayer.resume();
-      isSpotifyPlaying = true;
-      updatePlaybackStateUI(true);
-      startVisualizer();
+      setSpotifyPlaybackState(true);
+      startPlaybackStateMonitoring();
       console.log('Resumed playback');
     } catch (error) {
       console.error('Failed to resume:', error);
@@ -1697,10 +1568,7 @@ window.webampPlay = async function () {
 window.webampPause = async function () {
   if (spotifyPlayer && isSpotifyPlaying) {
     try {
-      await spotifyPlayer.pause();
-      isSpotifyPlaying = false;
-      updatePlaybackStateUI(false);
-      stopVisualizer();
+      await pauseSpotifyPlayback();
       console.log('Paused playback');
     } catch (error) {
       console.error('Failed to pause:', error);
@@ -1708,16 +1576,21 @@ window.webampPause = async function () {
   }
 }
 
-window.webampNext = function () {
-  if (spotifyPlayer) {
-    spotifyPlayer.nextTrack();
+window.webampStop = async function () {
+  try {
+    await stopSpotifyPlayback();
+    console.log('Stopped playback');
+  } catch (error) {
+    console.error('Failed to stop:', error);
   }
 }
 
+window.webampNext = function () {
+  advanceWebampTrack('next');
+}
+
 window.webampPrevious = function () {
-  if (spotifyPlayer) {
-    spotifyPlayer.previousTrack();
-  }
+  advanceWebampTrack('previous');
 }
 
 // Render after the skin has loaded.
@@ -1806,8 +1679,18 @@ function setupSeekingBar() {
   const seekingBar = document.getElementById('position') as HTMLInputElement;
   if (!seekingBar) return;
 
+  ['pointerdown', 'mousedown', 'touchstart', 'keydown'].forEach((eventName) => {
+    seekingBar.addEventListener(eventName, markSeekBarUserInteraction);
+  });
+
   seekingBar.addEventListener('change', async (e) => {
     if (!spotifyPlayer || !isSpotifyPlaying || isResumingPlayback) return;
+    if (isSyncingSeekBarFromSpotify) return;
+
+    if (Date.now() - lastSeekBarUserInteractionAt > 2000) {
+      console.log('Ignoring non-user seek bar change');
+      return;
+    }
 
     try {
       // Get current state to get accurate duration
@@ -1851,16 +1734,12 @@ async function handleResume(state: SpotifyPlaybackState) {
     const currentTrackUri = state.track_window?.current_track?.uri;
     if (!currentTrackUri) return;
 
-    // Get current position from seeking bar
-    const seekingBar = document.getElementById('position') as HTMLInputElement;
-    if (!seekingBar) return;
-    const percentage = parseFloat(seekingBar.value);
-    const position = Math.floor(state.duration * (percentage / 100));
+    const position = Math.max(0, lastSpotifyPosition || state.position || 0);
 
     console.log('Resuming playback:', { currentTrackUri, position });
 
     // Get fresh token
-    const tokenResponse = await fetch('http://localhost:3000/token');
+    const tokenResponse = await fetch(`${SPOTIFY_SERVER_BASE_URL}/token`);
     const tokenData = await tokenResponse.json();
     if (tokenData.error) throw new Error('No valid token available');
 
@@ -1892,20 +1771,13 @@ async function handleResume(state: SpotifyPlaybackState) {
       })
     });
 
-    // Add a delay before resuming the dummy audio to ensure Spotify has started
+    suppressPausedStateUntil = Date.now() + 1500;
     await new Promise(resolve => setTimeout(resolve, 500));
 
-    isSpotifyPlaying = true;
-    updatePlaybackStateUI(true);
-    startVisualizer();
+    desiredSpotifyPlayback = 'playing';
+    activeSpotifyUri = currentTrackUri;
+    setSpotifyPlaybackState(true);
     startPlaybackStateMonitoring();
-
-    // Resume dummy audio
-    const audioElements = document.querySelectorAll('audio');
-    audioElements.forEach(audio => {
-      audio.currentTime = position / 1000;
-      audio.play();
-    });
 
     // Reset resuming flag after a delay
     setTimeout(() => {
@@ -1913,7 +1785,8 @@ async function handleResume(state: SpotifyPlaybackState) {
     }, 1000);
   } catch (error) {
     console.error('Failed to resume playback:', error);
-    isSpotifyPlaying = false;
+    desiredSpotifyPlayback = 'paused';
+    setSpotifyPlaybackState(false);
     isResumingPlayback = false;
   }
 }
@@ -1945,114 +1818,77 @@ function setupSecondVisualizer() {
   // Add play/pause event listeners
   const playButton = document.querySelector('#main-window #play');
   const pauseButton = document.querySelector('#main-window #pause');
+  const stopButton = document.querySelector('#main-window #stop');
 
   if (playButton) {
     playButton.addEventListener('click', async (e) => {
-      // If already playing, prevent default behavior and do nothing
-      if (isSpotifyPlaying) {
-        e.preventDefault();
-        e.stopPropagation();
-        return;
-      }
+      e.preventDefault();
+      e.stopPropagation();
+
+      if (isSpotifyPlaying) return;
 
       try {
+        if (!spotifyPlayer) {
+          await initSpotifyPlayer();
+        }
+        if (!spotifyPlayer) return;
+
         const state = await spotifyPlayer.getCurrentState();
         if (!state) {
           console.log('No state, reinitializing player...');
           await initSpotifyPlayer();
         }
 
-        // Get current state again after potential reinitialization
+        if (!spotifyPlayer) return;
         const currentState = await spotifyPlayer.getCurrentState();
-        if (!currentState) return;
+        if (!currentState) {
+          (webamp as any).play();
+          return;
+        }
 
-        // If we were previously playing and just paused, resume
         if (currentState.track_window?.current_track && currentState.paused) {
           await handleResume(currentState);
         } else {
-          // Otherwise start new track
-          const selectedTrack = document.querySelector('#playlist-window .selected');
-          const selectedTrackKey = selectedTrack ? 
-            `${selectedTrack.querySelector('.track-title')?.textContent}-${selectedTrack.querySelector('.track-artist')?.textContent}` : '';
-          const selectedTrackUri = trackUriMap.get(selectedTrackKey);
-
-          if (selectedTrackUri) {
-            console.log('Playing new track:', selectedTrackUri);
-            lastPlayedTrackUri = selectedTrackUri;
-            await playSpotifyTrack(selectedTrackUri, 0);
-          }
+          (webamp as any).play();
         }
       } catch (error) {
         console.error('Play button error:', error);
-        isSpotifyPlaying = false;
+        desiredSpotifyPlayback = 'paused';
+        setSpotifyPlaybackState(false);
       }
-    }, { capture: true }); // Add capture: true to handle event before Webamp
+    }, { capture: true });
   }
 
   if (pauseButton) {
-    pauseButton.addEventListener('click', async () => {
+    pauseButton.addEventListener('click', async (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+
       if (spotifyPlayer && isSpotifyPlaying) {
         try {
-          await spotifyPlayer.pause();
-          isSpotifyPlaying = false;
-          updatePlaybackStateUI(false);
-          stopVisualizer();
+          await pauseSpotifyPlayback();
           console.log('Paused playback');
-
-          // Pause dummy audio
-          const audioElements = document.querySelectorAll('audio');
-          audioElements.forEach(audio => {
-            audio.pause();
-          });
         } catch (error) {
           console.error('Failed to pause:', error);
         }
       }
-    });
+    }, { capture: true });
+  }
+
+  if (stopButton) {
+    stopButton.addEventListener('click', async (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+
+      try {
+        await stopSpotifyPlayback();
+        console.log('Stopped playback');
+      } catch (error) {
+        console.error('Failed to stop:', error);
+      }
+    }, { capture: true });
   }
 }
-
-// Add cleanup for dummy audio cache
-window.addEventListener('beforeunload', () => {
-  // Revoke all cached dummy audio URLs
-  dummyAudioCache.forEach(url => {
-    if (url.startsWith('blob:')) {
-      URL.revokeObjectURL(url);
-    }
-  });
-  dummyAudioCache.clear();
-  
-  // Clear existing intervals
-  if (visualizerInterval) {
-    clearInterval(visualizerInterval);
-    visualizerInterval = null;
-  }
-  if (playbackStateInterval) {
-    clearInterval(playbackStateInterval);
-    playbackStateInterval = null;
-  }
-});
-
-// Add cleanup for blob URLs
-window.addEventListener('beforeunload', () => {
-  // Clean up all blob URLs
-  const tracks = document.querySelectorAll('audio');
-  tracks.forEach(track => {
-    if (track.src.startsWith('blob:')) {
-      URL.revokeObjectURL(track.src);
-    }
-  });
-  
-  // Clear existing intervals
-  if (visualizerInterval) {
-    clearInterval(visualizerInterval);
-    visualizerInterval = null;
-  }
-  if (playbackStateInterval) {
-    clearInterval(playbackStateInterval);
-    playbackStateInterval = null;
-  }
-});
 
 // Add this function after window.onload
 function setupMouseHandling() {
@@ -2190,56 +2026,6 @@ function enablePlaybackControls() {
       button.style.opacity = '1';
     }
   });
-}
-
-// Add this function to handle play button click
-function setupPlaybackControls() {
-  const playButton = document.querySelector('#main-window .actions #play') as HTMLElement;
-  if (playButton) {
-    playButton.addEventListener('click', async (e) => {
-      // If already playing, do nothing
-      if (isSpotifyPlaying) {
-        e.preventDefault();
-        e.stopPropagation();
-        return;
-      }
-    });
-  }
-}
-
-// Function to handle track playback
-async function handleTrackPlay(trackKey: string) {
-  console.log('Track lookup:', { trackKey, spotifyUri: trackUriMap.get(trackKey) });
-  const uri = trackUriMap.get(trackKey);
-  
-  if (!uri) {
-    console.error('No Spotify URI found for track:', trackKey);
-    return;
-  }
-
-  // Check if this is a Spotify track
-  if (uri.startsWith('spotify:track:') || uri.startsWith('spotify:local:')) {
-    console.log('Spotify track detected:', {
-      name: trackKey.split('-')[1].trim(),
-      artist: trackKey.split('-')[0].trim(),
-      uri,
-      playerInitialized: !!spotifyPlayer,
-      deviceId: currentDeviceId
-    });
-
-    // For local files, just let Webamp handle playback
-    if (uri.startsWith('spotify:local:')) {
-      console.log('Local file detected, letting Webamp handle playback');
-      return;
-    }
-
-    console.log('Starting Spotify playback...');
-    try {
-      await playSpotifyTrack(uri);
-    } catch (error) {
-      console.error('Failed to start Spotify playback:', error);
-    }
-  }
 }
 
 // Add this function after the existing functions

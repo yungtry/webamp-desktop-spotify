@@ -8,6 +8,7 @@ declare global {
         webampOnTrackDidChange: (track: Track) => void
         webampPlay: () => void
         webampPause: () => void
+        webampStop: () => void
         webampNext: () => void
         webampPrevious: () => void
         ipcRenderer: {

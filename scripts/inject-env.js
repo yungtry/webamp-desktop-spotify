@@ -17,7 +17,7 @@ function encrypt(text) {
 const env = {
   SPOTIFY_CLIENT_ID: encrypt(process.env.SPOTIFY_CLIENT_ID),
   SPOTIFY_CLIENT_SECRET: encrypt(process.env.SPOTIFY_CLIENT_SECRET),
-  SPOTIFY_REDIRECT_URI: encrypt(process.env.SPOTIFY_REDIRECT_URI || `http://localhost:3000/callback`),
+  SPOTIFY_REDIRECT_URI: encrypt(process.env.SPOTIFY_REDIRECT_URI || `http://127.0.0.1:3000/callback`),
 };
 
 fs.writeFileSync('./build-env.json', JSON.stringify(env, null, 2)); 

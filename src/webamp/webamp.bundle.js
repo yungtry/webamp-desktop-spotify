@@ -17894,6 +17894,15 @@ var selectors = __webpack_require__(4);
 
 
 
+function isSpotifyExternalPlaybackUrl(url) {
+  return typeof url === "string" && url.indexOf("/silence/") !== -1 && url.indexOf("uri=spotify%3A") !== -1;
+}
+
+function getCurrentTrackUrlFromState(state) {
+  const id = selectors["h" /* getCurrentTrackId */](state);
+  return id == null ? null : selectors["V" /* getTrackUrl */](state)(id);
+}
+
 /* harmony default export */ var mediaMiddleware = (media => store => {
   const _store$getState = store.getState(),
         _store$getState$media = _store$getState.media,
@@ -17955,18 +17964,33 @@ var selectors = __webpack_require__(4);
     const returnValue = next(action);
     const state = store.getState();
 
-    switch (action.type) {
-      case actionTypes["C" /* PLAY */]:
-        media.play();
-        break;
+	    switch (action.type) {
+	      case actionTypes["C" /* PLAY */]:
+	        if (isSpotifyExternalPlaybackUrl(getCurrentTrackUrlFromState(state))) {
+	          store.dispatch({
+	            type: actionTypes["p" /* IS_PLAYING */]
+	          });
+	          break;
+	        }
 
-      case actionTypes["B" /* PAUSE */]:
-        media.pause();
-        break;
+	        media.play();
+	        break;
 
-      case actionTypes["qb" /* STOP */]:
-        media.stop();
-        break;
+	      case actionTypes["B" /* PAUSE */]:
+	        if (isSpotifyExternalPlaybackUrl(getCurrentTrackUrlFromState(state))) {
+	          break;
+	        }
+
+	        media.pause();
+	        break;
+
+	      case actionTypes["qb" /* STOP */]:
+	        if (isSpotifyExternalPlaybackUrl(getCurrentTrackUrlFromState(state))) {
+	          break;
+	        }
+
+	        media.stop();
+	        break;
 
       case actionTypes["kb" /* SET_VOLUME */]:
         media.setVolume(selectors["cb" /* getVolume */](state));
@@ -17976,28 +18000,50 @@ var selectors = __webpack_require__(4);
         media.setBalance(selectors["a" /* getBalance */](state));
         break;
 
-      case actionTypes["M" /* SEEK_TO_PERCENT_COMPLETE */]:
-        media.seekToPercentComplete(action.percent);
-        break;
+	      case actionTypes["M" /* SEEK_TO_PERCENT_COMPLETE */]:
+	        if (isSpotifyExternalPlaybackUrl(getCurrentTrackUrlFromState(state))) {
+	          if (window.__webampSpotifySeekToPercent) {
+	            window.__webampSpotifySeekToPercent(action.percent);
+	          }
+	          break;
+	        }
+
+	        media.seekToPercentComplete(action.percent);
+	        break;
 
       case actionTypes["D" /* PLAY_TRACK */]:
         {
-          const url = selectors["V" /* getTrackUrl */](store.getState())(action.id);
+	          const url = selectors["V" /* getTrackUrl */](store.getState())(action.id);
 
-          if (url != null) {
-            media.loadFromUrl(url, true);
-          }
+	          if (url != null) {
+	            if (isSpotifyExternalPlaybackUrl(url)) {
+	              store.dispatch({
+	                type: actionTypes["Fb" /* UPDATE_TIME_ELAPSED */],
+	                elapsed: 0
+	              });
+	              store.dispatch({
+	                type: actionTypes["p" /* IS_PLAYING */]
+	              });
+	              break;
+	            }
+
+	            media.loadFromUrl(url, true);
+	          }
 
           break;
         }
 
       case actionTypes["c" /* BUFFER_TRACK */]:
         {
-          const url = selectors["V" /* getTrackUrl */](store.getState())(action.id);
+	          const url = selectors["V" /* getTrackUrl */](store.getState())(action.id);
 
-          if (url != null) {
-            media.loadFromUrl(url, false);
-          }
+	          if (url != null) {
+	            if (isSpotifyExternalPlaybackUrl(url)) {
+	              break;
+	            }
+
+	            media.loadFromUrl(url, false);
+	          }
 
           break;
         }
